@@ -2961,6 +2961,10 @@ size_t c3d_compress_ws(const uint8_t *input, int quality, uint8_t *output, size_
     if (quality < 1) quality = 1;
     if (quality > 101) quality = 101;
 
+    /* Lossless mode — delegate to the lossless path (matches c3d_compress_to) */
+    if (quality == 101)
+        return lossless_compress_to(input, output, output_cap);
+
     for (int i = 0; i < N3; i++)
         ws->vol[i] = (float)input[i] - 128.0f;
 
@@ -2989,8 +2993,25 @@ int c3d_decompress_ws(const uint8_t *compressed, size_t compressed_size, uint8_t
     if (!compressed || !output || !ws) return -1;
     init_tables();
     if (compressed_size < 8) return -1;
+
+    /* ROI format: "C3R\x01" — delegate to full decompress path */
+    if (compressed[0] == 'C' && compressed[1] == '3' &&
+        compressed[2] == 'R' && compressed[3] == 0x01)
+        return c3d_decompress_to(compressed, compressed_size, output);
+
     if (compressed[0] != 'C' || compressed[1] != '3' || compressed[2] != 'D' || compressed[3] != 0x04)
         return -1;
+
+    /* CRC verification before decoding */
+    { int rc = c3d_verify_crc(compressed, compressed_size); if (rc) return rc; }
+
+    /* Lossless mode: byte 6 == 1 — delegate to lossless path */
+    if (compressed[6] == 1)
+        return lossless_decompress_to(compressed, compressed_size, output);
+
+    /* Wavelet mode: byte 5 == WAVELET — delegate to wavelet path */
+    if (compressed[5] == C3D_TRANSFORM_WAVELET)
+        return c3d_decompress_wavelet_internal(compressed, compressed_size, output);
 
     int quality = compressed[4];
     uint32_t sym_len = compressed[8] | ((uint32_t)compressed[9]<<8)
@@ -4238,4 +4259,561 @@ void c3d_stream_free(c3d_stream_t *stream) {
     free(stream->threads);
     free(stream->slots);
     free(stream);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Multiscale Pyramid — "C3M\x01" container
+ *
+ * Stores a power-of-2 resolution pyramid where each level stores residuals
+ * against the upsampled coarser level. Progressive decode: level K requires
+ * levels 0..K-1 (cached).
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+#define C3M_MAGIC_0 'C'
+#define C3M_MAGIC_1 '3'
+#define C3M_MAGIC_2 'M'
+#define C3M_MAGIC_3 0x01
+#define C3M_HEADER_SIZE 32
+#define C3M_LEVEL_ENTRY_SIZE 16
+
+static int is_power_of_2(int v) { return v > 0 && (v & (v - 1)) == 0; }
+
+static int ilog2(int v) {
+    int r = 0;
+    while (v > 1) { v >>= 1; r++; }
+    return r;
+}
+
+int c3d_downsample_2x(const uint8_t *input, int sx, int sy, int sz, uint8_t *output) {
+    if (!input || !output) return -1;
+    if (sx < 2 || sy < 2 || sz < 2) return -1;
+    if ((sx & 1) || (sy & 1) || (sz & 1)) return -1;
+
+    int ox = sx / 2, oy = sy / 2, oz = sz / 2;
+    for (int z = 0; z < oz; z++)
+        for (int y = 0; y < oy; y++)
+            for (int x = 0; x < ox; x++) {
+                int iz = z * 2, iy = y * 2, ix = x * 2;
+                int sum = 0;
+                for (int dz = 0; dz < 2; dz++)
+                    for (int dy = 0; dy < 2; dy++)
+                        for (int dx = 0; dx < 2; dx++)
+                            sum += input[(iz+dz)*sy*sx + (iy+dy)*sx + (ix+dx)];
+                output[z*oy*ox + y*ox + x] = (uint8_t)((sum + 4) / 8);
+            }
+    return 0;
+}
+
+int c3d_upsample_2x(const uint8_t *input, int sx, int sy, int sz,
+                     int method, uint8_t *output) {
+    if (!input || !output) return -1;
+    if (sx < 1 || sy < 1 || sz < 1) return -1;
+
+    int ox = sx * 2, oy = sy * 2, oz = sz * 2;
+
+    if (method == C3D_UPSAMPLE_NEAREST || sx == 1 || sy == 1 || sz == 1) {
+        for (int z = 0; z < oz; z++)
+            for (int y = 0; y < oy; y++)
+                for (int x = 0; x < ox; x++)
+                    output[z*oy*ox + y*ox + x] = input[(z/2)*sy*sx + (y/2)*sx + (x/2)];
+        return 0;
+    }
+
+    /* Trilinear (also used as fallback for cubic) */
+    for (int z = 0; z < oz; z++)
+        for (int y = 0; y < oy; y++)
+            for (int x = 0; x < ox; x++) {
+                /* Map output coords to input coords with half-pixel offset */
+                float fx = ((float)x + 0.5f) * 0.5f - 0.5f;
+                float fy = ((float)y + 0.5f) * 0.5f - 0.5f;
+                float fz = ((float)z + 0.5f) * 0.5f - 0.5f;
+
+                int x0 = (int)floorf(fx), y0 = (int)floorf(fy), z0 = (int)floorf(fz);
+                float tx = fx - x0, ty = fy - y0, tz = fz - z0;
+
+                /* Clamp */
+                if (x0 < 0) { x0 = 0; tx = 0; }
+                if (y0 < 0) { y0 = 0; ty = 0; }
+                if (z0 < 0) { z0 = 0; tz = 0; }
+                int x1 = x0 + 1, y1 = y0 + 1, z1 = z0 + 1;
+                if (x1 >= sx) x1 = sx - 1;
+                if (y1 >= sy) y1 = sy - 1;
+                if (z1 >= sz) z1 = sz - 1;
+
+                #define S(zz,yy,xx) ((float)input[(zz)*sy*sx + (yy)*sx + (xx)])
+                float c00 = S(z0,y0,x0)*(1-tx) + S(z0,y0,x1)*tx;
+                float c01 = S(z0,y1,x0)*(1-tx) + S(z0,y1,x1)*tx;
+                float c10 = S(z1,y0,x0)*(1-tx) + S(z1,y0,x1)*tx;
+                float c11 = S(z1,y1,x0)*(1-tx) + S(z1,y1,x1)*tx;
+                float c0 = c00*(1-ty) + c01*ty;
+                float c1 = c10*(1-ty) + c11*ty;
+                float v = c0*(1-tz) + c1*tz;
+                #undef S
+
+                int iv = (int)(v + 0.5f);
+                if (iv < 0) iv = 0;
+                if (iv > 255) iv = 255;
+                output[z*oy*ox + y*ox + x] = (uint8_t)iv;
+            }
+    return 0;
+}
+
+/* Compute residuals: residual = original - upsampled_prediction.
+ * Stored as int8 mapped to uint8: residual + 128. */
+static void compute_residuals(const uint8_t *original, const uint8_t *predicted,
+                               uint8_t *residual, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        int r = (int)original[i] - (int)predicted[i] + 128;
+        if (r < 0) r = 0;
+        if (r > 255) r = 255;
+        residual[i] = (uint8_t)r;
+    }
+}
+
+/* Reconstruct: original = upsampled_prediction + (residual - 128). */
+static void apply_residuals(const uint8_t *predicted, const uint8_t *residual,
+                             uint8_t *output, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        int v = (int)predicted[i] + ((int)residual[i] - 128);
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        output[i] = (uint8_t)v;
+    }
+}
+
+static void write_le16_c3m(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v); p[1] = (uint8_t)(v >> 8);
+}
+static void write_le32_c3m(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v); p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static uint16_t read_le16_c3m(const uint8_t *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+static uint32_t read_le32_c3m(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+c3d_compressed_t c3d_multiscale_compress(const uint8_t *input,
+    int native_x, int native_y, int native_z,
+    const c3d_multiscale_params_t *params)
+{
+    c3d_compressed_t fail = { .data = NULL, .size = 0 };
+    if (!input || !params) return fail;
+    if (native_x < 1 || native_y < 1 || native_z < 1) return fail;
+    if (!is_power_of_2(native_x) || !is_power_of_2(native_y) || !is_power_of_2(native_z))
+        return fail;
+
+    init_tables();
+
+    int quality = params->quality;
+    if (quality < 1) quality = 1;
+    if (quality > 101) quality = 101;
+    int upsample = params->upsample_method;
+    if (upsample < 0 || upsample > 2) upsample = C3D_UPSAMPLE_TRILINEAR;
+
+    /* Determine number of levels: from native down to 1x1x1 */
+    int max_dim = native_x;
+    if (native_y > max_dim) max_dim = native_y;
+    if (native_z > max_dim) max_dim = native_z;
+    int num_levels = ilog2(max_dim) + 1;
+    if (num_levels > C3D_MAX_LEVELS) return fail;
+
+    /* Build the pyramid (downsample from native to 1x1x1) */
+    uint8_t **pyramid = (uint8_t **)calloc(num_levels, sizeof(uint8_t *));
+    int *dims_x = (int *)calloc(num_levels, sizeof(int));
+    int *dims_y = (int *)calloc(num_levels, sizeof(int));
+    int *dims_z = (int *)calloc(num_levels, sizeof(int));
+    if (!pyramid || !dims_x || !dims_y || !dims_z) goto cleanup_pyramid;
+
+    /* Level num_levels-1 = native */
+    dims_x[num_levels - 1] = native_x;
+    dims_y[num_levels - 1] = native_y;
+    dims_z[num_levels - 1] = native_z;
+    size_t native_size = (size_t)native_x * native_y * native_z;
+    pyramid[num_levels - 1] = (uint8_t *)malloc(native_size);
+    if (!pyramid[num_levels - 1]) goto cleanup_pyramid;
+    memcpy(pyramid[num_levels - 1], input, native_size);
+
+    /* Downsample to build coarser levels */
+    for (int lev = num_levels - 2; lev >= 0; lev--) {
+        int px = dims_x[lev + 1], py = dims_y[lev + 1], pz = dims_z[lev + 1];
+        dims_x[lev] = px > 1 ? px / 2 : 1;
+        dims_y[lev] = py > 1 ? py / 2 : 1;
+        dims_z[lev] = pz > 1 ? pz / 2 : 1;
+        size_t lsz = (size_t)dims_x[lev] * dims_y[lev] * dims_z[lev];
+        pyramid[lev] = (uint8_t *)malloc(lsz);
+        if (!pyramid[lev]) goto cleanup_pyramid;
+
+        if (px >= 2 && py >= 2 && pz >= 2) {
+            c3d_downsample_2x(pyramid[lev + 1], px, py, pz, pyramid[lev]);
+        } else {
+            /* Edge case: dimensions already at 1 — just copy the mean */
+            memcpy(pyramid[lev], pyramid[lev + 1], lsz);
+        }
+    }
+
+    /* Encode each level's residuals */
+    c3d_compressed_t *level_data = (c3d_compressed_t *)calloc(num_levels, sizeof(c3d_compressed_t));
+    if (!level_data) goto cleanup_pyramid;
+
+    /* Level 0: just store the single voxel (or small volume) raw */
+    size_t lev0_size = (size_t)dims_x[0] * dims_y[0] * dims_z[0];
+    level_data[0].data = (uint8_t *)malloc(lev0_size);
+    if (!level_data[0].data) goto cleanup_levels;
+    memcpy(level_data[0].data, pyramid[0], lev0_size);
+    level_data[0].size = lev0_size;
+
+    for (int lev = 1; lev < num_levels; lev++) {
+        size_t lsz = (size_t)dims_x[lev] * dims_y[lev] * dims_z[lev];
+
+        /* Upsample the coarser level */
+        uint8_t *upsampled = (uint8_t *)malloc(lsz);
+        if (!upsampled) goto cleanup_levels;
+        c3d_upsample_2x(pyramid[lev - 1], dims_x[lev - 1], dims_y[lev - 1],
+                         dims_z[lev - 1], upsample, upsampled);
+
+        /* Compute residuals */
+        uint8_t *residual = (uint8_t *)malloc(lsz);
+        if (!residual) { free(upsampled); goto cleanup_levels; }
+        compute_residuals(pyramid[lev], upsampled, residual, lsz);
+        free(upsampled);
+
+        /* Compress residuals */
+        if (lsz <= (size_t)N3) {
+            /* Small enough for a single C3D block */
+            if (lsz == (size_t)N3) {
+                level_data[lev] = c3d_compress(residual, quality);
+            } else {
+                /* Pad to 32^3, compress, store. For very small levels just store raw. */
+                level_data[lev].data = (uint8_t *)malloc(lsz);
+                if (level_data[lev].data) {
+                    memcpy(level_data[lev].data, residual, lsz);
+                    level_data[lev].size = lsz;
+                }
+            }
+        } else {
+            /* Large level: compress block-by-block and concatenate.
+             * We use a simple format: just compress each 32^3 block and
+             * pack them with a size prefix. */
+            int bx = (dims_x[lev] + N - 1) / N;
+            int by = (dims_y[lev] + N - 1) / N;
+            int bz = (dims_z[lev] + N - 1) / N;
+            int nblocks = bx * by * bz;
+
+            /* Estimate max output: 4 bytes per block size + block data */
+            size_t bound = c3d_compress_bound();
+            size_t max_out = (size_t)nblocks * (4 + bound);
+            uint8_t *out = (uint8_t *)malloc(max_out);
+            if (!out) { free(residual); goto cleanup_levels; }
+
+            size_t pos = 0;
+            /* Write block count header */
+            write_le32_c3m(out + pos, (uint32_t)nblocks); pos += 4;
+            write_le16_c3m(out + pos, (uint16_t)bx); pos += 2;
+            write_le16_c3m(out + pos, (uint16_t)by); pos += 2;
+            write_le16_c3m(out + pos, (uint16_t)bz); pos += 2;
+            pos += 2; /* padding */
+
+            for (int ibz = 0; ibz < bz; ibz++)
+                for (int iby = 0; iby < by; iby++)
+                    for (int ibx = 0; ibx < bx; ibx++) {
+                        /* Extract block */
+                        uint8_t block[N3];
+                        memset(block, 128, N3); /* neutral residual */
+                        for (int z = 0; z < N && ibz*N+z < dims_z[lev]; z++)
+                            for (int y = 0; y < N && iby*N+y < dims_y[lev]; y++)
+                                for (int x = 0; x < N && ibx*N+x < dims_x[lev]; x++)
+                                    block[z*N*N + y*N + x] =
+                                        residual[(ibz*N+z)*dims_y[lev]*dims_x[lev]
+                                                + (iby*N+y)*dims_x[lev]
+                                                + (ibx*N+x)];
+
+                        uint8_t comp_buf[65536];
+                        size_t csz = c3d_compress_to(block, quality, comp_buf, sizeof(comp_buf));
+                        if (csz == 0) csz = 0; /* failed — store empty */
+                        write_le32_c3m(out + pos, (uint32_t)csz); pos += 4;
+                        if (csz > 0) {
+                            memcpy(out + pos, comp_buf, csz);
+                            pos += csz;
+                        }
+                    }
+
+            level_data[lev].data = (uint8_t *)realloc(out, pos);
+            if (!level_data[lev].data) level_data[lev].data = out;
+            level_data[lev].size = pos;
+        }
+        free(residual);
+
+        if (!level_data[lev].data) goto cleanup_levels;
+    }
+
+    /* Pack into C3M container */
+    {
+        size_t dir_size = (size_t)num_levels * C3M_LEVEL_ENTRY_SIZE;
+        size_t data_offset = C3M_HEADER_SIZE + dir_size;
+        size_t total = data_offset;
+        for (int i = 0; i < num_levels; i++)
+            total += level_data[i].size;
+
+        uint8_t *container = (uint8_t *)malloc(total);
+        if (!container) goto cleanup_levels;
+
+        /* Header */
+        memset(container, 0, C3M_HEADER_SIZE);
+        container[0] = C3M_MAGIC_0;
+        container[1] = C3M_MAGIC_1;
+        container[2] = C3M_MAGIC_2;
+        container[3] = C3M_MAGIC_3;
+        container[4] = (uint8_t)num_levels;
+        container[5] = (uint8_t)quality;
+        container[6] = (uint8_t)upsample;
+        container[7] = 0; /* flags */
+        write_le32_c3m(container + 8, (uint32_t)native_x);
+        write_le32_c3m(container + 12, (uint32_t)native_y);
+        write_le32_c3m(container + 16, (uint32_t)native_z);
+        write_le32_c3m(container + 24, (uint32_t)total);
+
+        /* Level directory + data */
+        size_t offset = data_offset;
+        for (int i = 0; i < num_levels; i++) {
+            uint8_t *entry = container + C3M_HEADER_SIZE + i * C3M_LEVEL_ENTRY_SIZE;
+            write_le32_c3m(entry + 0, (uint32_t)offset);
+            write_le32_c3m(entry + 4, (uint32_t)level_data[i].size);
+            write_le16_c3m(entry + 8, (uint16_t)dims_x[i]);
+            write_le16_c3m(entry + 10, (uint16_t)dims_y[i]);
+            write_le16_c3m(entry + 12, (uint16_t)dims_z[i]);
+            write_le16_c3m(entry + 14, 0);
+
+            memcpy(container + offset, level_data[i].data, level_data[i].size);
+            offset += level_data[i].size;
+        }
+
+        /* Cleanup */
+        for (int i = 0; i < num_levels; i++) free(level_data[i].data);
+        free(level_data);
+        for (int i = 0; i < num_levels; i++) free(pyramid[i]);
+        free(pyramid); free(dims_x); free(dims_y); free(dims_z);
+
+        return (c3d_compressed_t){ .data = container, .size = total };
+    }
+
+cleanup_levels:
+    if (level_data) {
+        for (int i = 0; i < num_levels; i++)
+            free(level_data[i].data);
+        free(level_data);
+    }
+cleanup_pyramid:
+    if (pyramid) {
+        for (int i = 0; i < (dims_x ? ilog2(max_dim) + 1 : 0); i++)
+            free(pyramid[i]);
+    }
+    free(pyramid); free(dims_x); free(dims_y); free(dims_z);
+    return fail;
+}
+
+int c3d_multiscale_header(const uint8_t *data, size_t size,
+                           c3d_multiscale_header_t *header) {
+    if (!data || !header || size < C3M_HEADER_SIZE) return -1;
+    if (data[0] != C3M_MAGIC_0 || data[1] != C3M_MAGIC_1 ||
+        data[2] != C3M_MAGIC_2 || data[3] != C3M_MAGIC_3)
+        return -1;
+
+    header->num_levels = data[4];
+    header->quality = data[5];
+    header->upsample_method = data[6];
+    header->native_x = read_le32_c3m(data + 8);
+    header->native_y = read_le32_c3m(data + 12);
+    header->native_z = read_le32_c3m(data + 16);
+    header->total_size = read_le32_c3m(data + 24);
+
+    if (header->num_levels > C3D_MAX_LEVELS) return -1;
+
+    size_t dir_end = C3M_HEADER_SIZE + (size_t)header->num_levels * C3M_LEVEL_ENTRY_SIZE;
+    if (dir_end > size) return -1;
+
+    for (int i = 0; i < header->num_levels; i++) {
+        const uint8_t *entry = data + C3M_HEADER_SIZE + i * C3M_LEVEL_ENTRY_SIZE;
+        header->levels[i].offset = read_le32_c3m(entry + 0);
+        header->levels[i].size = read_le32_c3m(entry + 4);
+        header->levels[i].dim_x = read_le16_c3m(entry + 8);
+        header->levels[i].dim_y = read_le16_c3m(entry + 10);
+        header->levels[i].dim_z = read_le16_c3m(entry + 12);
+    }
+    return 0;
+}
+
+/* ── Level cache ── */
+
+struct c3d_level_cache {
+    uint8_t *levels[C3D_MAX_LEVELS];
+    size_t   sizes[C3D_MAX_LEVELS];
+};
+
+c3d_level_cache_t *c3d_level_cache_create(void) {
+    c3d_level_cache_t *c = (c3d_level_cache_t *)calloc(1, sizeof(c3d_level_cache_t));
+    return c;
+}
+
+void c3d_level_cache_free(c3d_level_cache_t *cache) {
+    if (!cache) return;
+    for (int i = 0; i < C3D_MAX_LEVELS; i++)
+        free(cache->levels[i]);
+    free(cache);
+}
+
+int c3d_multiscale_decompress_level(const uint8_t *data, size_t size,
+                                     int target_level,
+                                     uint8_t *output,
+                                     c3d_level_cache_t *cache)
+{
+    if (!data || !output) return -1;
+
+    c3d_multiscale_header_t hdr;
+    if (c3d_multiscale_header(data, size, &hdr) != 0) return -1;
+    if (target_level < 0 || target_level >= hdr.num_levels) return -1;
+
+    init_tables();
+
+    int upsample = hdr.upsample_method;
+
+    /* Recursively decode levels 0..target_level */
+    for (int lev = 0; lev <= target_level; lev++) {
+        size_t lsz = (size_t)hdr.levels[lev].dim_x * hdr.levels[lev].dim_y * hdr.levels[lev].dim_z;
+
+        /* Check cache */
+        if (cache && cache->levels[lev] && cache->sizes[lev] == lsz) {
+            if (lev == target_level)
+                memcpy(output, cache->levels[lev], lsz);
+            continue;
+        }
+
+        uint8_t *decoded = (uint8_t *)malloc(lsz);
+        if (!decoded) return -1;
+
+        const uint8_t *lev_data = data + hdr.levels[lev].offset;
+        size_t lev_size = hdr.levels[lev].size;
+
+        if (lev == 0) {
+            /* Level 0: raw voxel data */
+            if (lev_size < lsz) { free(decoded); return -1; }
+            memcpy(decoded, lev_data, lsz);
+        } else {
+            /* Need the coarser level */
+            uint8_t *coarser;
+            size_t coarser_sz = (size_t)hdr.levels[lev-1].dim_x *
+                                hdr.levels[lev-1].dim_y * hdr.levels[lev-1].dim_z;
+            if (cache && cache->levels[lev - 1] && cache->sizes[lev - 1] == coarser_sz) {
+                coarser = cache->levels[lev - 1];
+            } else {
+                free(decoded);
+                return -1; /* coarser level not in cache — should have been decoded first */
+            }
+
+            /* Upsample coarser to this level's dimensions */
+            uint8_t *upsampled = (uint8_t *)malloc(lsz);
+            if (!upsampled) { free(decoded); return -1; }
+            c3d_upsample_2x(coarser, hdr.levels[lev-1].dim_x,
+                            hdr.levels[lev-1].dim_y, hdr.levels[lev-1].dim_z,
+                            upsample, upsampled);
+
+            /* Decode residuals */
+            uint8_t *residual = (uint8_t *)malloc(lsz);
+            if (!residual) { free(decoded); free(upsampled); return -1; }
+
+            if (lsz <= (size_t)N3 && lsz == (size_t)N3) {
+                /* Single C3D block */
+                if (c3d_decompress(lev_data, lev_size, residual) != 0) {
+                    free(decoded); free(upsampled); free(residual);
+                    return -1;
+                }
+            } else if (lsz <= (size_t)N3) {
+                /* Raw small residual */
+                if (lev_size < lsz) {
+                    free(decoded); free(upsampled); free(residual);
+                    return -1;
+                }
+                memcpy(residual, lev_data, lsz);
+            } else {
+                /* Multi-block: read block count header, decompress each */
+                if (lev_size < 12) {
+                    free(decoded); free(upsampled); free(residual);
+                    return -1;
+                }
+                uint32_t nblocks = read_le32_c3m(lev_data);
+                int bx = read_le16_c3m(lev_data + 4);
+                int by = read_le16_c3m(lev_data + 6);
+                int bz = read_le16_c3m(lev_data + 8);
+                (void)nblocks;
+
+                /* Initialize residual to neutral (128) */
+                memset(residual, 128, lsz);
+
+                size_t pos = 12;
+                int dx = hdr.levels[lev].dim_x;
+                int dy = hdr.levels[lev].dim_y;
+                int dz = hdr.levels[lev].dim_z;
+
+                for (int ibz = 0; ibz < bz; ibz++)
+                    for (int iby = 0; iby < by; iby++)
+                        for (int ibx = 0; ibx < bx; ibx++) {
+                            if (pos + 4 > lev_size) break;
+                            uint32_t csz = read_le32_c3m(lev_data + pos); pos += 4;
+                            if (csz == 0) continue;
+                            if (pos + csz > lev_size) break;
+
+                            uint8_t block[N3];
+                            if (c3d_decompress(lev_data + pos, csz, block) != 0) {
+                                pos += csz;
+                                continue;
+                            }
+                            pos += csz;
+
+                            /* Scatter block into residual volume */
+                            for (int z = 0; z < N && ibz*N+z < dz; z++)
+                                for (int y = 0; y < N && iby*N+y < dy; y++)
+                                    for (int x = 0; x < N && ibx*N+x < dx; x++)
+                                        residual[(ibz*N+z)*dy*dx + (iby*N+y)*dx + (ibx*N+x)]
+                                            = block[z*N*N + y*N + x];
+                        }
+            }
+
+            /* Reconstruct: output = upsampled + (residual - 128) */
+            apply_residuals(upsampled, residual, decoded, lsz);
+            free(upsampled);
+            free(residual);
+        }
+
+        /* Store in cache */
+        if (cache) {
+            free(cache->levels[lev]);
+            cache->levels[lev] = (uint8_t *)malloc(lsz);
+            if (cache->levels[lev]) {
+                memcpy(cache->levels[lev], decoded, lsz);
+                cache->sizes[lev] = lsz;
+            }
+        }
+
+        if (lev == target_level)
+            memcpy(output, decoded, lsz);
+        free(decoded);
+    }
+    return 0;
+}
+
+int c3d_multiscale_decompress(const uint8_t *data, size_t size, uint8_t *output) {
+    if (!data || !output) return -1;
+
+    c3d_multiscale_header_t hdr;
+    if (c3d_multiscale_header(data, size, &hdr) != 0) return -1;
+
+    c3d_level_cache_t *cache = c3d_level_cache_create();
+    if (!cache) return -1;
+
+    int rc = c3d_multiscale_decompress_level(data, size, hdr.num_levels - 1, output, cache);
+    c3d_level_cache_free(cache);
+    return rc;
 }

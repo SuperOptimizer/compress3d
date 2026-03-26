@@ -303,4 +303,180 @@ c3d_compressed_t c3d_compress_roi(const uint8_t *input, int quality, const c3d_r
  */
 void c3d_deblock(uint8_t *volume, int vx, int vy, int vz, float strength);
 
+/* ══════════════════════════════════════════════════════════════════════════════
+ * Multiscale Pyramid — "C3M\x01" container
+ *
+ * Stores a full power-of-2 resolution pyramid where each level encodes only
+ * the residual detail relative to the upsampled coarser level. Level 0 is the
+ * coarsest (1x1x1 = single voxel), level N is native resolution.
+ *
+ * Decoding is progressive: to reconstruct level K you need levels 0..K-1
+ * (cached), upsample K-1 to K dimensions, and add the level K residuals.
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+#define C3D_MAX_LEVELS 20
+#define C3D_UPSAMPLE_NEAREST   0
+#define C3D_UPSAMPLE_TRILINEAR 1
+#define C3D_UPSAMPLE_CUBIC     2
+
+/* Multiscale compression parameters. */
+typedef struct {
+    int quality;          /* 1-101 (same as c3d_compress) */
+    int upsample_method;  /* C3D_UPSAMPLE_TRILINEAR recommended */
+    int num_threads;      /* 0 = auto */
+} c3d_multiscale_params_t;
+
+/* Per-level metadata in a C3M container. */
+typedef struct {
+    uint32_t offset;      /* byte offset from container start */
+    uint32_t size;        /* compressed size */
+    uint16_t dim_x, dim_y, dim_z;
+} c3d_level_info_t;
+
+/* Header for a C3M container. */
+typedef struct {
+    int num_levels;
+    int quality;
+    int upsample_method;
+    uint32_t native_x, native_y, native_z;
+    uint32_t total_size;
+    c3d_level_info_t levels[C3D_MAX_LEVELS];
+} c3d_multiscale_header_t;
+
+/* Downsample a volume by 2x in each dimension (2x2x2 average pooling).
+ * input: sx*sy*sz bytes. output: (sx/2)*(sy/2)*(sz/2) bytes.
+ * sx, sy, sz must be even. Returns 0 on success, -1 on error. */
+int c3d_downsample_2x(const uint8_t *input, int sx, int sy, int sz, uint8_t *output);
+
+/* Upsample a volume by 2x in each dimension.
+ * input: sx*sy*sz bytes. output: (2*sx)*(2*sy)*(2*sz) bytes.
+ * method: C3D_UPSAMPLE_NEAREST, C3D_UPSAMPLE_TRILINEAR, or C3D_UPSAMPLE_CUBIC.
+ * Returns 0 on success, -1 on error. */
+int c3d_upsample_2x(const uint8_t *input, int sx, int sy, int sz,
+                     int method, uint8_t *output);
+
+/* Compress a volume into a multiscale C3M container.
+ * input: native_x * native_y * native_z bytes (dimensions must be powers of 2).
+ * params: compression parameters.
+ * Returns compressed blob. Caller must free result.data. */
+c3d_compressed_t c3d_multiscale_compress(const uint8_t *input,
+    int native_x, int native_y, int native_z,
+    const c3d_multiscale_params_t *params);
+
+/* Read the header from a C3M container without decompressing.
+ * Returns 0 on success, -1 on error. */
+int c3d_multiscale_header(const uint8_t *data, size_t size,
+                           c3d_multiscale_header_t *header);
+
+/* Opaque cache for decoded pyramid levels. */
+typedef struct c3d_level_cache c3d_level_cache_t;
+
+/* Create a level cache. Returns NULL on failure. */
+c3d_level_cache_t *c3d_level_cache_create(void);
+
+/* Free a level cache and all cached levels. */
+void c3d_level_cache_free(c3d_level_cache_t *cache);
+
+/* Decompress a single level from a C3M container.
+ * Recursively decodes coarser levels as needed, using the cache.
+ * output: must point to level_dimx * level_dimy * level_dimz bytes.
+ * Returns 0 on success, -1 on error. */
+int c3d_multiscale_decompress_level(const uint8_t *data, size_t size,
+                                     int target_level,
+                                     uint8_t *output,
+                                     c3d_level_cache_t *cache);
+
+/* Convenience: decompress at native resolution (highest level).
+ * output must be native_x * native_y * native_z bytes. */
+int c3d_multiscale_decompress(const uint8_t *data, size_t size,
+                               uint8_t *output);
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ * UDP Serving Protocol
+ *
+ * Streams multiscale C3D data over UDP with coarse-to-fine progressive
+ * delivery. Designed for low-latency volumetric data viewing.
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+#define C3D_UDP_PORT_DEFAULT 7333
+#define C3D_UDP_MAX_PAYLOAD  1384
+#define C3D_UDP_HEADER_SIZE  16
+
+/* Message types */
+#define C3D_MSG_REQUEST   0
+#define C3D_MSG_RESPONSE  1
+#define C3D_MSG_ACK       2
+#define C3D_MSG_NACK      3
+#define C3D_MSG_CANCEL    4
+
+/* Region types for requests */
+#define C3D_REGION_SINGLE 0
+#define C3D_REGION_BOX    1
+#define C3D_REGION_SPHERE 2
+
+/* Priority levels */
+#define C3D_PRIORITY_BG     0
+#define C3D_PRIORITY_NORMAL 1
+#define C3D_PRIORITY_URGENT 2
+
+/* UDP datagram header (16 bytes, packed little-endian) */
+typedef struct {
+    uint16_t request_id;
+    uint8_t  msg_type;
+    uint8_t  flags;          /* bit 0: more_fragments, bit 1: last_fragment */
+    uint8_t  level;
+    uint16_t chunk_x;
+    uint16_t chunk_y;
+    uint16_t chunk_z;
+    uint8_t  fragment_idx;
+    uint8_t  fragment_count;
+    uint16_t payload_size;
+} c3d_udp_header_t;
+
+/* Server */
+typedef struct c3d_server c3d_server_t;
+
+/* Create a UDP server for a C3M volume (or directory of shards).
+ * volume_path: path to C3M file or shard directory.
+ * port: UDP port to bind (0 = C3D_UDP_PORT_DEFAULT). */
+c3d_server_t *c3d_server_create(const char *volume_path, int port);
+
+/* Run the server event loop (blocks). Returns 0 on clean shutdown. */
+int c3d_server_run(c3d_server_t *server);
+
+/* Signal the server to stop. Thread-safe. */
+void c3d_server_stop(c3d_server_t *server);
+
+/* Free server resources. */
+void c3d_server_free(c3d_server_t *server);
+
+/* Client */
+typedef struct c3d_client c3d_client_t;
+
+/* Callback when a decompressed chunk arrives. */
+typedef void (*c3d_chunk_cb)(int level, int cx, int cy, int cz,
+                              const uint8_t *data, size_t data_size,
+                              void *userdata);
+
+/* Create a UDP client connecting to a C3D server. */
+c3d_client_t *c3d_client_create(const char *host, int port,
+                                 c3d_chunk_cb cb, void *userdata);
+
+/* Request a box region at up to max_level detail.
+ * min_level: skip coarser levels if already cached.
+ * Chunks are delivered via the callback, coarse-to-fine. */
+int c3d_client_request_region(c3d_client_t *c,
+    int x0, int y0, int z0, int x1, int y1, int z1,
+    int max_level, int min_level, int priority);
+
+/* Cancel pending requests above a level. */
+int c3d_client_cancel_above(c3d_client_t *c, int level);
+
+/* Poll for incoming data. timeout_ms: -1=block, 0=non-blocking.
+ * Returns number of chunks received, or -1 on error. */
+int c3d_client_poll(c3d_client_t *c, int timeout_ms);
+
+/* Destroy client. */
+void c3d_client_free(c3d_client_t *c);
+
 #endif
