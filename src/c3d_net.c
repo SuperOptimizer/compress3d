@@ -9,6 +9,29 @@
 
 #ifndef _WIN32
 
+/* Internal protocol constants */
+#define C3D_UDP_MAX_PAYLOAD  1384
+#define C3D_UDP_HEADER_SIZE  16
+#define C3D_MSG_REQUEST   0
+#define C3D_MSG_RESPONSE  1
+#define C3D_MSG_CANCEL    4
+#define C3D_REGION_SINGLE 0
+#define C3D_REGION_BOX    1
+
+/* UDP datagram header (16 bytes, packed little-endian) */
+typedef struct {
+    uint16_t request_id;
+    uint8_t  msg_type;
+    uint8_t  flags;
+    uint8_t  level;
+    uint16_t chunk_x;
+    uint16_t chunk_y;
+    uint16_t chunk_z;
+    uint8_t  fragment_idx;
+    uint8_t  fragment_count;
+    uint16_t payload_size;
+} c3d_udp_header_t;
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

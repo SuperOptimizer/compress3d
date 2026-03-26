@@ -6,6 +6,15 @@
 #include <pthread.h>
 #include <unistd.h>
 
+/* Internal wire format flags (not part of public API) */
+#define C3D_FLAG_INTERLEAVED 0x02
+#define C3D_FLAG_HAS_CRC  0x04
+#define C3D_FLAG_HAS_META 0x08
+#define C3D_FLAG_SPARSE   0x10
+#define C3D_FLAG_COEFF_PRED 0x20
+#define C3D_TRANSFORM_DCT     0
+#define C3D_TRANSFORM_WAVELET 1
+
 #ifdef __aarch64__
 #include <arm_neon.h>
 #elif defined(__x86_64__) || defined(_M_X64)
@@ -1218,7 +1227,7 @@ static void coeff_predict_inverse(int32_t *quant) {
 }
 
 static void coeffs_to_symbols(const int32_t *quant, symstream_t *s) {
-    init_vlq_table();
+    /* vlq_table is initialized by do_init_tables() via pthread_once */
     int i = 0;
     while (i < N3) {
         if (quant[zigzag_order[i]] == 0) {
@@ -1921,7 +1930,7 @@ static int c3d_verify_crc(const uint8_t *compressed, size_t size) {
     c3d_parse_sections(compressed,size,&stored,&hc,&dm,&hm);
     if (!hc) return 0;
     size_t pe=c3d_payload_end(compressed,size);
-    return (c3d_crc32(compressed,pe)==stored)?0:C3D_ERR_CHECKSUM;
+    return (c3d_crc32(compressed,pe)==stored)?0:-1;
 }
 
 c3d_compressed_t c3d_compress_meta(const uint8_t *input, int quality, const c3d_metadata_t *meta) {
@@ -2337,6 +2346,12 @@ int c3d_decompress_progressive(const uint8_t *compressed, size_t compressed_size
     return 0;
 }
 
+/* Forward declarations for batch functions (defined in Section 8) */
+static int c3d_compress_batch(const uint8_t **inputs, int count, int quality,
+                              int num_threads, c3d_compressed_t *outputs);
+static int c3d_decompress_batch(const c3d_compressed_t *compressed, int count,
+                                int num_threads, uint8_t **outputs);
+
 /* ════════════════════════════════════════════════════════════════════════════
  * SECTION 7: Shard API — inter-chunk DC delta coding
  *
@@ -2722,8 +2737,8 @@ static int get_num_threads(int num_threads, int count) {
     return num_threads;
 }
 
-int c3d_compress_batch(const uint8_t **inputs, int count, int quality,
-                       int num_threads, c3d_compressed_t *outputs) {
+static int c3d_compress_batch(const uint8_t **inputs, int count, int quality,
+                              int num_threads, c3d_compressed_t *outputs) {
     if (!inputs || !outputs) return -1;
     if (count <= 0) return 0;
     if (quality < 1) quality = 1;
@@ -2761,8 +2776,8 @@ int c3d_compress_batch(const uint8_t **inputs, int count, int quality,
     return ctx.error ? -1 : 0;
 }
 
-int c3d_decompress_batch(const c3d_compressed_t *compressed, int count,
-                         int num_threads, uint8_t **outputs) {
+static int c3d_decompress_batch(const c3d_compressed_t *compressed, int count,
+                                int num_threads, uint8_t **outputs) {
     if (!compressed || !outputs) return -1;
     if (count <= 0) return 0;
     init_tables();
@@ -3064,20 +3079,56 @@ int c3d_quality_report(const uint8_t *original, const uint8_t *reconstructed,
                         c3d_quality_report_t *report) {
     if (!original || !reconstructed || !report || count == 0) return -1;
 
-    report->mse = c3d_mse(original, reconstructed, count);
+    /* Single fused pass for all scalar metrics */
+    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+    double sum_sq_err = 0, sum_abs_err = 0;
+    int maxe = 0;
+    uint8_t vmin = 255, vmax = 0;
+    uint32_t ha[256] = {0}, hb[256] = {0};
+
+    for (size_t i = 0; i < count; i++) {
+        double va = (double)original[i], vb = (double)reconstructed[i];
+        double d = va - vb;
+        sum_sq_err += d * d;
+        int ad = (d < 0) ? (int)(-d) : (int)d;
+        sum_abs_err += ad;
+        if (ad > maxe) maxe = ad;
+        sa += va; sb += vb;
+        saa += va * va; sbb += vb * vb;
+        sab += va * vb;
+        if (original[i] < vmin) vmin = original[i];
+        if (original[i] > vmax) vmax = original[i];
+        ha[original[i]]++;
+        hb[reconstructed[i]]++;
+    }
+
+    double n = (double)count;
+    report->mse = sum_sq_err / n;
     report->psnr = (report->mse > 0) ? 10.0 * log10(255.0 * 255.0 / report->mse) : INFINITY;
     report->rmse = sqrt(report->mse);
-    report->nrmse = c3d_nrmse(original, reconstructed, count);
-    report->mae = c3d_mae(original, reconstructed, count);
-    report->max_error = c3d_max_error(original, reconstructed, count);
-    report->snr = c3d_snr(original, reconstructed, count);
+    double range = (double)(vmax - vmin);
+    report->nrmse = (range > 0) ? report->rmse / range : 0.0;
+    report->mae = sum_abs_err / n;
+    report->max_error = maxe;
+
+    double mean_a = sa / n;
+    double signal_var = saa / n - mean_a * mean_a;
+    report->snr = (report->mse > 0) ? 10.0 * log10(signal_var / report->mse) : INFINITY;
+
+    double corr_num = n * sab - sa * sb;
+    double corr_den = sqrt((n * saa - sa * sa) * (n * sbb - sb * sb));
+    report->correlation = (corr_den > 0) ? corr_num / corr_den : 0.0;
+
+    uint64_t hist_inter = 0;
+    for (int i = 0; i < 256; i++)
+        hist_inter += (ha[i] < hb[i]) ? ha[i] : hb[i];
+    report->histogram_intersection = (double)hist_inter / n;
+
     report->ssim = (count == (size_t)N3) ? c3d_ssim(original, reconstructed) : 0.0;
-    report->correlation = c3d_correlation(original, reconstructed, count);
-    report->histogram_intersection = c3d_histogram_intersection(original, reconstructed, count);
     report->compression_ratio = (compressed_size > 0) ?
-        c3d_compression_ratio(count, compressed_size) : 0.0;
+        (double)count / (double)compressed_size : 0.0;
     report->bits_per_voxel = (compressed_size > 0) ?
-        c3d_bits_per_voxel(compressed_size, count) : 0.0;
+        (double)(compressed_size * 8) / n : 0.0;
 
     return 0;
 }
@@ -3190,7 +3241,7 @@ static void emit_vlq_ws(symstream_t *s, uint32_t folded, c3d_workspace_t *ws) {
 }
 
 static void coeffs_to_symbols_ws(const int32_t *qdata, symstream_t *s, c3d_workspace_t *ws) {
-    init_vlq_table();
+    /* vlq_table is initialized by do_init_tables() via pthread_once */
     int i = 0;
     while (i < N3) {
         if (qdata[zigzag_order[i]] == 0) {
@@ -3737,7 +3788,7 @@ static void wavelet_rd_optimize(const int32_t *coeffs, int32_t *quant,
     }
 }
 
-size_t c3d_compress_wavelet_to(const uint8_t *input, int quality, uint8_t *output, size_t output_cap) {
+static size_t c3d_compress_wavelet_to(const uint8_t *input, int quality, uint8_t *output, size_t output_cap) {
     if (!input || !output) return 0;
     init_tables();
     if (quality < 1) quality = 1;

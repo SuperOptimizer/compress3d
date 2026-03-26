@@ -25,7 +25,7 @@ static void chunk_callback(int level, int cx, int cy, int cz,
     (void)cx; (void)cy; (void)cz; (void)data; (void)userdata;
     pthread_mutex_lock(&cb_mtx);
     chunks_received++;
-    if (level >= 0 && level < C3D_MAX_LEVELS)
+    if (level >= 0 && level < 20)
         levels_seen[level]++;
     pthread_mutex_unlock(&cb_mtx);
 }
@@ -92,7 +92,7 @@ static void test_udp_loopback(void) {
     chunks_received = 0;
     memset(levels_seen, 0, sizeof(levels_seen));
 
-    int rc = c3d_client_request_region(client, 0, 0, 0, 0, 0, 0, 5, 0, C3D_PRIORITY_NORMAL);
+    int rc = c3d_client_request_region(client, 0, 0, 0, 0, 0, 0, 5, 0, 1 /* normal priority */);
     ASSERT(rc == 0, "request sent");
 
     /* Poll for responses */
@@ -117,34 +117,7 @@ static void test_udp_loopback(void) {
     unlink(tmppath);
 }
 
-static void test_header_pack_unpack(void) {
-    c3d_udp_header_t h = {
-        .request_id = 0x1234,
-        .msg_type = C3D_MSG_RESPONSE,
-        .flags = 0x03,
-        .level = 5,
-        .chunk_x = 10,
-        .chunk_y = 20,
-        .chunk_z = 30,
-        .fragment_idx = 2,
-        .fragment_count = 4,
-        .payload_size = 1000
-    };
-
-    /* Pack and unpack should roundtrip */
-    uint8_t buf[C3D_UDP_HEADER_SIZE];
-    /* We can't call pack_header directly (it's static), so test via
-     * the client/server which use it internally.
-     * Instead, test that the struct layout is correct. */
-    ASSERT(sizeof(c3d_udp_header_t) >= 14, "header struct has all fields");
-    ASSERT(h.request_id == 0x1234, "field check request_id");
-    ASSERT(h.level == 5, "field check level");
-    ASSERT(h.chunk_z == 30, "field check chunk_z");
-    (void)buf;
-}
-
 int main(void) {
-    test_header_pack_unpack();
     test_udp_loopback();
 
     printf("\n%d passed, %d failed\n", passes, failures);

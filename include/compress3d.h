@@ -24,12 +24,11 @@ typedef struct {
 c3d_compressed_t c3d_compress(const uint8_t *input, int quality);
 
 /*
- * Decompress back to NxNxN grayscale 8-bit volume.
- * The size is read from the compressed header.
+ * Decompress back to 32^3 grayscale 8-bit volume.
  *   compressed: blob from c3d_compress
- *   output:     must point to at least size^3 bytes
+ *   output:     must point to at least 32768 bytes
  * Returns 0 on success, -1 on error. NULL params return -1.
- * Thread-safe (no shared state).
+ * Thread-safe (no shared state). Equivalent to c3d_decompress_to.
  */
 int c3d_decompress(const uint8_t *compressed, size_t compressed_size, uint8_t *output);
 
@@ -74,35 +73,14 @@ c3d_compressed_t c3d_compress_shard(const uint8_t **chunks, int nx, int ny, int 
 int c3d_decompress_shard(const uint8_t *compressed, size_t compressed_size,
                           uint8_t **chunks, int nx, int ny, int nz, int num_threads);
 
-/* Compress multiple 32^3 chunks in parallel using a thread pool.
- * inputs: array of pointers to 32768-byte volumes
- * count: number of chunks
- * quality: 1-101 (clamped). NULL inputs/outputs returns -1.
- * num_threads: number of worker threads (0 = auto-detect CPU count)
- * outputs: array of c3d_compressed_t results (caller must free each .data)
- * Returns 0 on success, -1 on error.
- */
-int c3d_compress_batch(const uint8_t **inputs, int count, int quality,
-                       int num_threads, c3d_compressed_t *outputs);
-
-/* Decompress multiple chunks in parallel.
- * compressed: array of {data, size} pairs
- * count: number of chunks
- * num_threads: number of worker threads (0 = auto-detect)
- * outputs: array of pointers to pre-allocated 32768-byte buffers
- * Returns 0 on success, -1 on error. NULL params return -1.
- */
-int c3d_decompress_batch(const c3d_compressed_t *compressed, int count,
-                         int num_threads, uint8_t **outputs);
-
 /* Compute 3D SSIM between two 32^3 volumes. Returns value in [0, 1].
  * NULL params return 0.0. Thread-safe. */
 double c3d_ssim(const uint8_t *original, const uint8_t *reconstructed);
 
 /* ══════════════════════════════════════════════════════════════════════════════
  * Quality metrics — all operate on arbitrary-length uint8 buffers.
- * Pass count = number of voxels. NULL params return 0.0 (or -1 for error).
- * All are thread-safe (no shared state).
+ * Pass count = number of voxels. NULL params return 0.0 for doubles, 0 for ints.
+ * c3d_psnr returns INFINITY for identical inputs. All are thread-safe.
  * ══════════════════════════════════════════════════════════════════════════════ */
 
 /* Mean Squared Error */
@@ -192,21 +170,6 @@ size_t c3d_compress_ws(const uint8_t *input, int quality, uint8_t *output, size_
  * NULL params return -1. Not thread-safe for same ws. */
 int c3d_decompress_ws(const uint8_t *compressed, size_t compressed_size, uint8_t *output, c3d_workspace_t *ws);
 
-/* Error codes */
-#define C3D_ERR_OK        0
-#define C3D_ERR_FORMAT   (-1)
-#define C3D_ERR_CHECKSUM (-2)
-#define C3D_ERR_ALLOC    (-3)  /* Memory allocation failed */
-#define C3D_ERR_PARAM    (-4)  /* Invalid parameter (NULL pointer, bad dimensions) */
-#define C3D_ERR_SIZE     (-5)  /* Buffer too small */
-
-/* Header flags (stored in header byte 7) */
-#define C3D_FLAG_INTERLEAVED 0x02
-#define C3D_FLAG_HAS_CRC  0x04
-#define C3D_FLAG_HAS_META 0x08
-#define C3D_FLAG_SPARSE   0x10
-#define C3D_FLAG_COEFF_PRED 0x20
-
 /* Metadata for medical/scientific volumes */
 typedef struct {
     float voxel_size[3];     /* Voxel dimensions in mm (0 = unspecified) */
@@ -228,14 +191,6 @@ c3d_compressed_t c3d_compress_meta(const uint8_t *input, int quality, const c3d_
  */
 int c3d_get_metadata(const uint8_t *compressed, size_t size, c3d_metadata_t *meta);
 
-/* Transform type flags (stored in header byte 5) */
-#define C3D_TRANSFORM_DCT     0
-#define C3D_TRANSFORM_WAVELET 1
-
-/* Compression mode flags (stored in header byte 6) */
-#define C3D_MODE_LOSSY    0
-#define C3D_MODE_LOSSLESS 1
-
 /*
  * Compress using CDF 5/3 (Le Gall) wavelet transform instead of DCT.
  * Better for sharp edges (less ringing). Integer-based, faster than DCT.
@@ -243,12 +198,6 @@ int c3d_get_metadata(const uint8_t *compressed, size_t size, c3d_metadata_t *met
  * quality: clamped to [1, 101]. NULL input returns {NULL, 0}. Thread-safe.
  */
 c3d_compressed_t c3d_compress_wavelet(const uint8_t *input, int quality);
-
-/*
- * Wavelet version of c3d_compress_to.
- * quality: clamped to [1, 101]. NULL input/output returns 0.
- */
-size_t c3d_compress_wavelet_to(const uint8_t *input, int quality, uint8_t *output, size_t output_cap);
 
 /*
  * Compress with progressive bitstream. Can be truncated at any byte
@@ -473,40 +422,9 @@ int c3d_multiscale_decompress(const uint8_t *data, size_t size,
  * delivery. Designed for low-latency volumetric data viewing.
  * ══════════════════════════════════════════════════════════════════════════════ */
 
+#ifndef _WIN32
+
 #define C3D_UDP_PORT_DEFAULT 7333
-#define C3D_UDP_MAX_PAYLOAD  1384
-#define C3D_UDP_HEADER_SIZE  16
-
-/* Message types */
-#define C3D_MSG_REQUEST   0
-#define C3D_MSG_RESPONSE  1
-#define C3D_MSG_ACK       2
-#define C3D_MSG_NACK      3
-#define C3D_MSG_CANCEL    4
-
-/* Region types for requests */
-#define C3D_REGION_SINGLE 0
-#define C3D_REGION_BOX    1
-#define C3D_REGION_SPHERE 2
-
-/* Priority levels */
-#define C3D_PRIORITY_BG     0
-#define C3D_PRIORITY_NORMAL 1
-#define C3D_PRIORITY_URGENT 2
-
-/* UDP datagram header (16 bytes, packed little-endian) */
-typedef struct {
-    uint16_t request_id;
-    uint8_t  msg_type;
-    uint8_t  flags;          /* bit 0: more_fragments, bit 1: last_fragment */
-    uint8_t  level;
-    uint16_t chunk_x;
-    uint16_t chunk_y;
-    uint16_t chunk_z;
-    uint8_t  fragment_idx;
-    uint8_t  fragment_count;
-    uint16_t payload_size;
-} c3d_udp_header_t;
 
 /* Server */
 typedef struct c3d_server c3d_server_t;
@@ -554,4 +472,6 @@ int c3d_client_poll(c3d_client_t *c, int timeout_ms);
 /* Destroy client. */
 void c3d_client_free(c3d_client_t *c);
 
-#endif
+#endif /* !_WIN32 */
+
+#endif /* COMPRESS3D_H */
