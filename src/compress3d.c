@@ -1,6 +1,7 @@
 #include "compress3d.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <math.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -2845,6 +2846,256 @@ double c3d_ssim(const uint8_t *original, const uint8_t *reconstructed) {
     }
 
     return total_ssim / num_windows;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Quality Metrics — comprehensive suite for volumetric data evaluation
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+double c3d_mse(const uint8_t *a, const uint8_t *b, size_t count) {
+    if (!a || !b || count == 0) return 0.0;
+    double sum = 0.0;
+    for (size_t i = 0; i < count; i++) {
+        double d = (double)a[i] - (double)b[i];
+        sum += d * d;
+    }
+    return sum / (double)count;
+}
+
+double c3d_psnr(const uint8_t *a, const uint8_t *b, size_t count) {
+    double mse = c3d_mse(a, b, count);
+    if (mse <= 0.0) return INFINITY;
+    return 10.0 * log10(255.0 * 255.0 / mse);
+}
+
+double c3d_mae(const uint8_t *a, const uint8_t *b, size_t count) {
+    if (!a || !b || count == 0) return 0.0;
+    double sum = 0.0;
+    for (size_t i = 0; i < count; i++) {
+        int d = (int)a[i] - (int)b[i];
+        sum += (d < 0) ? -d : d;
+    }
+    return sum / (double)count;
+}
+
+int c3d_max_error(const uint8_t *a, const uint8_t *b, size_t count) {
+    if (!a || !b || count == 0) return 0;
+    int maxe = 0;
+    for (size_t i = 0; i < count; i++) {
+        int d = (int)a[i] - (int)b[i];
+        if (d < 0) d = -d;
+        if (d > maxe) maxe = d;
+    }
+    return maxe;
+}
+
+double c3d_rmse(const uint8_t *a, const uint8_t *b, size_t count) {
+    return sqrt(c3d_mse(a, b, count));
+}
+
+double c3d_nrmse(const uint8_t *a, const uint8_t *b, size_t count) {
+    if (!a || !b || count == 0) return 0.0;
+    /* Normalized by the value range of the original */
+    uint8_t vmin = 255, vmax = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (a[i] < vmin) vmin = a[i];
+        if (a[i] > vmax) vmax = a[i];
+    }
+    double range = (double)(vmax - vmin);
+    if (range <= 0.0) return 0.0;
+    return c3d_rmse(a, b, count) / range;
+}
+
+double c3d_snr(const uint8_t *original, const uint8_t *reconstructed, size_t count) {
+    if (!original || !reconstructed || count == 0) return 0.0;
+    double sum = 0.0, sum_sq = 0.0;
+    for (size_t i = 0; i < count; i++) {
+        double v = (double)original[i];
+        sum += v;
+        sum_sq += v * v;
+    }
+    double mean = sum / (double)count;
+    double signal_var = sum_sq / (double)count - mean * mean;
+    double noise_var = c3d_mse(original, reconstructed, count);
+    if (noise_var <= 0.0) return INFINITY;
+    return 10.0 * log10(signal_var / noise_var);
+}
+
+double c3d_correlation(const uint8_t *a, const uint8_t *b, size_t count) {
+    if (!a || !b || count == 0) return 0.0;
+    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+    for (size_t i = 0; i < count; i++) {
+        double va = (double)a[i], vb = (double)b[i];
+        sa += va; sb += vb;
+        saa += va * va; sbb += vb * vb;
+        sab += va * vb;
+    }
+    double n = (double)count;
+    double num = n * sab - sa * sb;
+    double den = sqrt((n * saa - sa * sa) * (n * sbb - sb * sb));
+    if (den <= 0.0) return 0.0;
+    return num / den;
+}
+
+double c3d_ssim_volume(const uint8_t *a, const uint8_t *b,
+                        int sx, int sy, int sz) {
+    if (!a || !b || sx < SSIM_WIN || sy < SSIM_WIN || sz < SSIM_WIN) return 0.0;
+
+    double total = 0.0;
+    int nwin = 0;
+
+    for (int z = 0; z <= sz - SSIM_WIN; z += SSIM_STEP)
+        for (int y = 0; y <= sy - SSIM_WIN; y += SSIM_STEP)
+            for (int x = 0; x <= sx - SSIM_WIN; x += SSIM_STEP) {
+                double sx2 = 0, sy2 = 0, sxx = 0, syy = 0, sxy = 0;
+                int cnt = SSIM_WIN * SSIM_WIN * SSIM_WIN;
+
+                for (int dz = 0; dz < SSIM_WIN; dz++)
+                    for (int dy = 0; dy < SSIM_WIN; dy++)
+                        for (int dx = 0; dx < SSIM_WIN; dx++) {
+                            double va = a[(z+dz)*sy*sx + (y+dy)*sx + (x+dx)];
+                            double vb = b[(z+dz)*sy*sx + (y+dy)*sx + (x+dx)];
+                            sx2 += va; sy2 += vb;
+                            sxx += va*va; syy += vb*vb;
+                            sxy += va*vb;
+                        }
+
+                double mx = sx2/cnt, my = sy2/cnt;
+                double vx = sxx/cnt - mx*mx;
+                double vy = syy/cnt - my*my;
+                double cov = sxy/cnt - mx*my;
+
+                double num = (2*mx*my + SSIM_C1) * (2*cov + SSIM_C2);
+                double den = (mx*mx + my*my + SSIM_C1) * (vx + vy + SSIM_C2);
+                total += num / den;
+                nwin++;
+            }
+
+    return nwin > 0 ? total / nwin : 0.0;
+}
+
+double c3d_ms_ssim(const uint8_t *a, const uint8_t *b,
+                    int sx, int sy, int sz) {
+    if (!a || !b) return 0.0;
+    if (sx < 16 || sy < 16 || sz < 16) return c3d_ssim_volume(a, b, sx, sy, sz);
+
+    /* MS-SSIM weights from Wang et al. (5 scales) */
+    static const double weights[5] = {0.0448, 0.2856, 0.3001, 0.2363, 0.1333};
+    int nscales = 5;
+    /* Limit scales by min dimension */
+    while (nscales > 1 && (sx >> (nscales-1)) < 8) nscales--;
+    while (nscales > 1 && (sy >> (nscales-1)) < 8) nscales--;
+    while (nscales > 1 && (sz >> (nscales-1)) < 8) nscales--;
+
+    double result = 1.0;
+    double wsum = 0.0;
+
+    uint8_t *ca = NULL, *cb = NULL;
+    const uint8_t *pa = a, *pb = b;
+    int cx = sx, cy = sy, cz = sz;
+
+    for (int s = 0; s < nscales; s++) {
+        double ssim = c3d_ssim_volume(pa, pb, cx, cy, cz);
+        double w = weights[s];
+        wsum += w;
+
+        /* Last scale: use full SSIM; earlier scales: use only contrast/structure */
+        if (s < nscales - 1) {
+            /* Approximate: SSIM^weight */
+            result *= pow(ssim > 0 ? ssim : 1e-10, w);
+        } else {
+            result *= pow(ssim > 0 ? ssim : 1e-10, w);
+        }
+
+        /* Downsample for next scale */
+        if (s < nscales - 1) {
+            int nx = cx/2, ny = cy/2, nz = cz/2;
+            if (nx < 4 || ny < 4 || nz < 4) break;
+
+            uint8_t *da = (uint8_t *)malloc((size_t)nx * ny * nz);
+            uint8_t *db = (uint8_t *)malloc((size_t)nx * ny * nz);
+            if (!da || !db) { free(da); free(db); break; }
+
+            c3d_downsample_2x(pa, cx, cy, cz, da);
+            c3d_downsample_2x(pb, cx, cy, cz, db);
+
+            free(ca); free(cb);
+            ca = da; cb = db;
+            pa = ca; pb = cb;
+            cx = nx; cy = ny; cz = nz;
+        }
+    }
+
+    free(ca); free(cb);
+
+    /* Normalize weights */
+    return pow(result, 1.0 / wsum);
+}
+
+double c3d_histogram_intersection(const uint8_t *a, const uint8_t *b, size_t count) {
+    if (!a || !b || count == 0) return 0.0;
+
+    uint32_t ha[256] = {0}, hb[256] = {0};
+    for (size_t i = 0; i < count; i++) {
+        ha[a[i]]++;
+        hb[b[i]]++;
+    }
+
+    uint64_t intersection = 0;
+    for (int i = 0; i < 256; i++) {
+        intersection += (ha[i] < hb[i]) ? ha[i] : hb[i];
+    }
+
+    return (double)intersection / (double)count;
+}
+
+double c3d_compression_ratio(size_t original_size, size_t compressed_size) {
+    if (compressed_size == 0) return 0.0;
+    return (double)original_size / (double)compressed_size;
+}
+
+double c3d_bits_per_voxel(size_t compressed_size, size_t num_voxels) {
+    if (num_voxels == 0) return 0.0;
+    return (double)(compressed_size * 8) / (double)num_voxels;
+}
+
+int c3d_quality_report(const uint8_t *original, const uint8_t *reconstructed,
+                        size_t count, size_t compressed_size,
+                        c3d_quality_report_t *report) {
+    if (!original || !reconstructed || !report || count == 0) return -1;
+
+    report->mse = c3d_mse(original, reconstructed, count);
+    report->psnr = (report->mse > 0) ? 10.0 * log10(255.0 * 255.0 / report->mse) : INFINITY;
+    report->rmse = sqrt(report->mse);
+    report->nrmse = c3d_nrmse(original, reconstructed, count);
+    report->mae = c3d_mae(original, reconstructed, count);
+    report->max_error = c3d_max_error(original, reconstructed, count);
+    report->snr = c3d_snr(original, reconstructed, count);
+    report->ssim = (count == (size_t)N3) ? c3d_ssim(original, reconstructed) : 0.0;
+    report->correlation = c3d_correlation(original, reconstructed, count);
+    report->histogram_intersection = c3d_histogram_intersection(original, reconstructed, count);
+    report->compression_ratio = (compressed_size > 0) ?
+        c3d_compression_ratio(count, compressed_size) : 0.0;
+    report->bits_per_voxel = (compressed_size > 0) ?
+        c3d_bits_per_voxel(compressed_size, count) : 0.0;
+
+    return 0;
+}
+
+void c3d_quality_report_print(const c3d_quality_report_t *r) {
+    if (!r) return;
+    printf("  MSE:           %.4f\n", r->mse);
+    printf("  PSNR:          %.2f dB\n", r->psnr);
+    printf("  RMSE:          %.4f\n", r->rmse);
+    printf("  NRMSE:         %.6f\n", r->nrmse);
+    printf("  MAE:           %.4f\n", r->mae);
+    printf("  Max Error:     %d\n", r->max_error);
+    printf("  SNR:           %.2f dB\n", r->snr);
+    printf("  SSIM:          %.6f\n", r->ssim);
+    printf("  Correlation:   %.6f\n", r->correlation);
+    printf("  Hist Intersect:%.4f\n", r->histogram_intersection);
+    printf("  Comp Ratio:    %.2f:1\n", r->compression_ratio);
+    printf("  Bits/Voxel:    %.3f\n", r->bits_per_voxel);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════

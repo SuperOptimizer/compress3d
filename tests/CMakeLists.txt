@@ -9,3 +9,7 @@ add_test(NAME test_multiscale COMMAND test_multiscale)
 add_executable(test_udp test_udp.c)
 target_link_libraries(test_udp PRIVATE compress3d)
 add_test(NAME test_udp COMMAND test_udp)
+
+add_executable(test_metrics test_metrics.c)
+target_link_libraries(test_metrics PRIVATE compress3d)
+add_test(NAME test_metrics COMMAND test_metrics)

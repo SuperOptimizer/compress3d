@@ -99,6 +99,81 @@ int c3d_decompress_batch(const c3d_compressed_t *compressed, int count,
  * NULL params return 0.0. Thread-safe. */
 double c3d_ssim(const uint8_t *original, const uint8_t *reconstructed);
 
+/* ══════════════════════════════════════════════════════════════════════════════
+ * Quality metrics — all operate on arbitrary-length uint8 buffers.
+ * Pass count = number of voxels. NULL params return 0.0 (or -1 for error).
+ * All are thread-safe (no shared state).
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+/* Mean Squared Error */
+double c3d_mse(const uint8_t *a, const uint8_t *b, size_t count);
+
+/* Peak Signal-to-Noise Ratio (dB). Returns INFINITY for identical inputs. */
+double c3d_psnr(const uint8_t *a, const uint8_t *b, size_t count);
+
+/* Mean Absolute Error */
+double c3d_mae(const uint8_t *a, const uint8_t *b, size_t count);
+
+/* Max Absolute Error (L-infinity norm) */
+int c3d_max_error(const uint8_t *a, const uint8_t *b, size_t count);
+
+/* Root Mean Squared Error */
+double c3d_rmse(const uint8_t *a, const uint8_t *b, size_t count);
+
+/* Normalized Root Mean Squared Error (NRMSE), normalized by value range. [0,1] */
+double c3d_nrmse(const uint8_t *a, const uint8_t *b, size_t count);
+
+/* Signal-to-Noise Ratio (dB). signal_var / noise_var. */
+double c3d_snr(const uint8_t *original, const uint8_t *reconstructed, size_t count);
+
+/* Pearson correlation coefficient. Returns value in [-1, 1]. */
+double c3d_correlation(const uint8_t *a, const uint8_t *b, size_t count);
+
+/* SSIM for arbitrary-length buffers (windowed, not just 32^3).
+ * Uses 8^3 sliding window. Returns mean SSIM in [0, 1]. */
+double c3d_ssim_volume(const uint8_t *a, const uint8_t *b,
+                        int sx, int sy, int sz);
+
+/* Multi-Scale SSIM (MS-SSIM). Downsamples 4 times, combines SSIM at each scale.
+ * Returns value in [0, 1]. Requires dimensions >= 16. */
+double c3d_ms_ssim(const uint8_t *a, const uint8_t *b,
+                    int sx, int sy, int sz);
+
+/* Histogram intersection: fraction of shared histogram area. [0, 1]. */
+double c3d_histogram_intersection(const uint8_t *a, const uint8_t *b, size_t count);
+
+/* Compression ratio: original_size / compressed_size. */
+double c3d_compression_ratio(size_t original_size, size_t compressed_size);
+
+/* Bits per voxel */
+double c3d_bits_per_voxel(size_t compressed_size, size_t num_voxels);
+
+/* Full quality report: computes all metrics at once. */
+typedef struct {
+    double mse;
+    double psnr;
+    double rmse;
+    double nrmse;
+    double mae;
+    int    max_error;
+    double snr;
+    double ssim;
+    double correlation;
+    double histogram_intersection;
+    double compression_ratio;
+    double bits_per_voxel;
+} c3d_quality_report_t;
+
+/* Generate a full quality report comparing original vs reconstructed.
+ * compressed_size: size of the compressed data (for ratio/bpv), 0 to skip.
+ * Returns 0 on success, -1 on error. */
+int c3d_quality_report(const uint8_t *original, const uint8_t *reconstructed,
+                        size_t count, size_t compressed_size,
+                        c3d_quality_report_t *report);
+
+/* Print a quality report to stdout. */
+void c3d_quality_report_print(const c3d_quality_report_t *report);
+
 /* Opaque workspace (~264KB). Amortizes allocation across compress/decompress calls.
  * Thread safety: each thread needs its own workspace. Not safe to share. */
 typedef struct c3d_workspace c3d_workspace_t;
