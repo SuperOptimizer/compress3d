@@ -424,17 +424,21 @@ static void transform_rows(float * restrict vol, const float mat[N][N], int nrow
 /* Fused 3-axis DCT: shares a single tmp buffer across all axes instead of
  * allocating a separate N3-sized stack array per axis call. */
 static void dct3d_forward_all(float * restrict vol) {
-    float tmp[N3];
+    float *tmp = (float *)malloc(N3 * sizeof(float));
+    if (!tmp) return;
     transform_rows(vol, dct_matrix, N * N);
     transpose_xy(vol, tmp); transform_rows(tmp, dct_matrix, N * N); transpose_xy(tmp, vol);
     transpose_xz(vol, tmp); transform_rows(tmp, dct_matrix, N * N); transpose_xz(tmp, vol);
+    free(tmp);
 }
 
 static void dct3d_inverse_all(float * restrict vol) {
-    float tmp[N3];
+    float *tmp = (float *)malloc(N3 * sizeof(float));
+    if (!tmp) return;
     transpose_xz(vol, tmp); transform_rows(tmp, idct_matrix, N * N); transpose_xz(tmp, vol);
     transpose_xy(vol, tmp); transform_rows(tmp, idct_matrix, N * N); transpose_xy(tmp, vol);
     transform_rows(vol, idct_matrix, N * N);
+    free(tmp);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -630,7 +634,9 @@ static void rd_optimize_coeffs(const float *coeffs, int32_t *quant,
             quant[i] = 0;
         } else if (cost_b < cost_a) {
             quant[i] = q_alt;
-            if (q == 0) last_nz = (zi > last_nz) ? zi : last_nz;
+            /* If we promoted a zero to non-zero, extend last_nz to include it */
+            if (q == 0 && q_alt != 0 && zi > last_nz)
+                last_nz = zi;
         }
         /* else keep q */
     }
@@ -1120,11 +1126,9 @@ static void rans_decode_ctx(const uint8_t *compressed, int comp_len,
                               uint8_t sym_tables[][RANS_PROB_SCALE],
                               uint8_t *output, int orig_len) {
     (void)sym_tables;
-    rans_decode_entry_t *dtables = (rans_decode_entry_t *)malloc(
-        NUM_CTX_GROUPS * RANS_PROB_SCALE * sizeof(rans_decode_entry_t));
-    if (!dtables) { if (orig_len > 0) memset(output, 0, (size_t)orig_len); return; }
-    rans_decode_ctx_core(compressed, comp_len, models, dtables, output, orig_len);
-    free(dtables);
+    /* Thread-local decode tables avoid 192KB malloc/free per call */
+    static _Thread_local rans_decode_entry_t tls_dtables[NUM_CTX_GROUPS * RANS_PROB_SCALE];
+    rans_decode_ctx_core(compressed, comp_len, models, tls_dtables, output, orig_len);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -1776,10 +1780,9 @@ static int c3d_decompress_roi(const uint8_t *compressed, size_t compressed_size,
 /* ── CRC32 and Metadata support ── */
 
 static uint32_t c3d_crc32_table[4][256];
-static int c3d_crc32_table_init = 0;
+static pthread_once_t crc32_once = PTHREAD_ONCE_INIT;
 
-static void c3d_crc32_init(void) {
-    if (c3d_crc32_table_init) return;
+static void do_init_crc32_table(void) {
     /* Build base table (slice 0) */
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t c = i;
@@ -1795,7 +1798,10 @@ static void c3d_crc32_init(void) {
             c3d_crc32_table[s][i] = c;
         }
     }
-    c3d_crc32_table_init = 1;
+}
+
+static void c3d_crc32_init(void) {
+    pthread_once(&crc32_once, do_init_crc32_table);
 }
 
 static uint32_t c3d_crc32(const uint8_t *data, size_t len) {
@@ -2341,6 +2347,21 @@ int c3d_decompress_progressive(const uint8_t *compressed, size_t compressed_size
 
 #define SHARD_HEADER_SIZE 8
 
+/* Portable float ↔ LE byte encoding for shard delta storage */
+static void float_to_le(float f, uint8_t *p) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    p[0] = (uint8_t)(u); p[1] = (uint8_t)(u >> 8);
+    p[2] = (uint8_t)(u >> 16); p[3] = (uint8_t)(u >> 24);
+}
+static float float_from_le(const uint8_t *p) {
+    uint32_t u = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+               | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
 static float compute_mean(const uint8_t *chunk) {
     uint32_t sum = 0;
 #ifdef __aarch64__
@@ -2448,8 +2469,8 @@ c3d_compressed_t c3d_compress_shard(const uint8_t **chunks, int nx, int ny, int 
     p += SHARD_HEADER_SIZE;
 
     for (int i = 0; i < nchunks; i++) {
-        memcpy(p, &deltas[i], sizeof(float));
-        p += sizeof(float);
+        float_to_le(deltas[i], p);
+        p += 4;
     }
     for (int i = 0; i < nchunks; i++) {
         uint32_t sz = (uint32_t)comp[i].size;
@@ -2488,8 +2509,8 @@ int c3d_decompress_shard(const uint8_t *compressed, size_t compressed_size,
     uint32_t *sizes = (uint32_t *)malloc(nchunks * sizeof(uint32_t));
     if (!deltas || !sizes) { free(deltas); free(sizes); return -1; }
     for (int i = 0; i < nchunks; i++) {
-        memcpy(&deltas[i], p, sizeof(float));
-        p += sizeof(float);
+        deltas[i] = float_from_le(p);
+        p += 4;
     }
 
     for (int i = 0; i < nchunks; i++) {
@@ -2581,9 +2602,9 @@ int c3d_decompress_shard_chunk(const uint8_t *compressed, size_t compressed_size
     uint32_t *sizes = (uint32_t *)malloc(nchunks * sizeof(uint32_t));
     if (!deltas || !sizes) { free(deltas); free(sizes); return -1; }
     for (int i = 0; i < nchunks; i++) {
-        memcpy(&deltas[i], p + i * sizeof(float), sizeof(float));
+        deltas[i] = float_from_le(p + i * 4);
     }
-    p += nchunks * sizeof(float);
+    p += nchunks * 4;
 
     for (int i = 0; i < nchunks; i++) {
         sizes[i] = p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -3362,10 +3383,12 @@ static void wavelet_compute_qtable(float base_step, float *qtable) {
             for (int x = 0; x < N; x++) {
                 int lx = wavelet_subband_level(x);
                 int idx = z * N * N + y * N + x;
-                /* Use the finest (lowest-numbered) subband among the 3 axes */
-                int min_level = lx < ly ? lx : ly;
-                if (lz < min_level) min_level = lz;
-                qtable[idx] = base_step * level_scale[min_level];
+                /* Use the coarsest (highest-numbered) subband among the 3 axes.
+                 * Mixed subbands like HLL should be quantized based on their
+                 * coarsest constraining axis, not their finest. */
+                int max_level = lx > ly ? lx : ly;
+                if (lz > max_level) max_level = lz;
+                qtable[idx] = base_step * level_scale[max_level];
             }
         }
     }
@@ -4020,7 +4043,9 @@ int c3d_shard_writer_finish(c3d_shard_writer_t *w) {
     if (fwrite(hdr, 1, SHARD_HEADER_SIZE, w->fp) != SHARD_HEADER_SIZE) goto cleanup;
 
     for (int i = 0; i < w->nchunks; i++) {
-        if (fwrite(&w->deltas[i], sizeof(float), 1, w->fp) != 1) goto cleanup;
+        uint8_t fb[4];
+        float_to_le(w->deltas[i], fb);
+        if (fwrite(fb, 1, 4, w->fp) != 4) goto cleanup;
     }
 
     for (int i = 0; i < w->nchunks; i++) {
