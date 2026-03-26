@@ -99,6 +99,23 @@ static float freq_scale_table[N3];
 static float freq_dist_table[N3];
 static pthread_once_t tables_once = PTHREAD_ONCE_INIT;
 
+/* Precomputed partial inverse DCT matrices for M = 1, 2, 4, 8, 16 */
+#define NUM_PARTIAL_SIZES 5
+static float *partial_idct[NUM_PARTIAL_SIZES]; /* M×M matrices for M=1,2,4,8,16 */
+static int partial_dims[NUM_PARTIAL_SIZES] = {1, 2, 4, 8, 16};
+
+/* Thread-local DCT scratch buffer (avoids malloc per block) */
+static _Thread_local float *tls_dct_tmp = NULL;
+static _Thread_local int tls_dct_tmp_inited = 0;
+
+static float *get_dct_tmp(void) {
+    if (!tls_dct_tmp_inited) {
+        tls_dct_tmp = (float *)malloc(N3 * sizeof(float));
+        tls_dct_tmp_inited = 1;
+    }
+    return tls_dct_tmp;
+}
+
 /* Quality step lookup table - initialized in do_init_tables */
 static float quality_step_table[102];
 
@@ -189,6 +206,19 @@ static void do_init_tables(void) {
         }
     }
     vlq_table_inited = 1;
+
+    /* Precompute partial inverse DCT matrices for sub-cube decode */
+    for (int pi = 0; pi < NUM_PARTIAL_SIZES; pi++) {
+        int M = partial_dims[pi];
+        partial_idct[pi] = (float *)malloc(M * M * sizeof(float));
+        if (partial_idct[pi]) {
+            for (int n = 0; n < M; n++)
+                for (int k = 0; k < M; k++) {
+                    float alpha = (k == 0) ? sqrtf(1.0f / M) : sqrtf(2.0f / M);
+                    partial_idct[pi][n * M + k] = alpha * cosf((float)M_PI * (2*n + 1) * k / (2*M));
+                }
+        }
+    }
 }
 
 static void init_tables(void) {
@@ -434,21 +464,21 @@ static void transform_rows(float * restrict vol, const float mat[N][N], int nrow
 /* Fused 3-axis DCT: shares a single tmp buffer across all axes instead of
  * allocating a separate N3-sized stack array per axis call. */
 static void dct3d_forward_all(float * restrict vol) {
-    float *tmp = (float *)malloc(N3 * sizeof(float));
-    if (!tmp) return;
+    float *tmp = get_dct_tmp();
+    if (!tmp) { tmp = (float *)malloc(N3 * sizeof(float)); if (!tmp) return; }
     transform_rows(vol, dct_matrix, N * N);
     transpose_xy(vol, tmp); transform_rows(tmp, dct_matrix, N * N); transpose_xy(tmp, vol);
     transpose_xz(vol, tmp); transform_rows(tmp, dct_matrix, N * N); transpose_xz(tmp, vol);
-    free(tmp);
+    /* TLS buffer is reused, don't free */
 }
 
 static void dct3d_inverse_all(float * restrict vol) {
-    float *tmp = (float *)malloc(N3 * sizeof(float));
-    if (!tmp) return;
+    float *tmp = get_dct_tmp();
+    if (!tmp) { tmp = (float *)malloc(N3 * sizeof(float)); if (!tmp) return; }
     transpose_xz(vol, tmp); transform_rows(tmp, idct_matrix, N * N); transpose_xz(tmp, vol);
     transpose_xy(vol, tmp); transform_rows(tmp, idct_matrix, N * N); transpose_xy(tmp, vol);
     transform_rows(vol, idct_matrix, N * N);
-    free(tmp);
+    /* TLS buffer is reused, don't free */
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -1876,6 +1906,62 @@ c3d_compressed_t c3d_compress_step(const uint8_t *input, float step, int max_coe
     return (c3d_compressed_t){ .data = buf, .size = actual };
 }
 
+c3d_compressed_t c3d_compress_ratio(const uint8_t *input, float target_ratio) {
+    if (!input || target_ratio < 1.0f) return (c3d_compressed_t){ .data = NULL, .size = 0 };
+    init_tables();
+
+    /* Get lossless size as baseline */
+    c3d_compressed_t lossless = c3d_compress(input, 101);
+    if (!lossless.data) return (c3d_compressed_t){ .data = NULL, .size = 0 };
+    size_t lossless_size = lossless.size;
+
+    if (target_ratio <= 1.0f) return lossless; /* 1x = lossless */
+
+    size_t target_size = (size_t)(lossless_size / target_ratio);
+    if (target_size < 32) target_size = 32;
+    free(lossless.data);
+
+    /* Strategy: combine step and coefficient truncation.
+     * Start with low step (good quality) and find the right coeff budget.
+     * If that doesn't hit the target, increase step. */
+
+    c3d_compressed_t best = { .data = NULL, .size = 0 };
+    size_t best_diff = (size_t)-1;
+
+    /* Try coefficient truncation at various step levels */
+    float steps_to_try[] = {0.5f, 2.0f, 5.0f, 10.0f, 20.0f, 50.0f, 100.0f, 200.0f, 500.0f};
+    int nsteps = 9;
+
+    for (int si = 0; si < nsteps; si++) {
+        /* Binary search over max_coeffs at this step */
+        int lo = 1, hi = N3;
+        for (int iter = 0; iter < 15; iter++) {
+            int mid = (lo + hi) / 2;
+            c3d_compressed_t trial = c3d_compress_step(input, steps_to_try[si], mid);
+            if (!trial.data) { lo = mid + 1; continue; }
+
+            size_t diff = (trial.size > target_size) ?
+                trial.size - target_size : target_size - trial.size;
+
+            if (diff < best_diff) {
+                free(best.data);
+                best = trial;
+                best_diff = diff;
+            } else {
+                free(trial.data);
+            }
+
+            if (trial.size > target_size) hi = mid - 1;
+            else lo = mid + 1;
+        }
+
+        /* If we're within 10% of target, good enough */
+        if (best.data && best_diff <= target_size / 10) break;
+    }
+
+    return best;
+}
+
 static int c3d_decompress_wavelet_internal(const uint8_t *compressed, size_t compressed_size, uint8_t *output);
 
 static int c3d_decompress_roi(const uint8_t *compressed, size_t compressed_size, uint8_t *output);
@@ -2350,19 +2436,28 @@ static void inverse_dct_partial(const float *coeffs, int M, float *output) {
         return;
     }
 
-    /* Build M×M×M inverse DCT matrices by taking the first M rows/columns.
-     * idct_sub[n][k] = idct_matrix[n * N/M][k] scaled by sqrt(N/M) for
-     * energy normalization... Actually, the correct approach is simpler:
-     * just build M×M DCT-II basis directly. */
     int M3 = M * M * M;
-    float *idct_sub = (float *)malloc(M * M * sizeof(float));
-    if (!idct_sub) return;
 
-    for (int n = 0; n < M; n++)
-        for (int k = 0; k < M; k++) {
-            float alpha = (k == 0) ? sqrtf(1.0f / M) : sqrtf(2.0f / M);
-            idct_sub[n * M + k] = alpha * cosf((float)M_PI * (2*n + 1) * k / (2*M));
+    /* Use precomputed partial DCT table if available */
+    float *idct_sub = NULL;
+    int need_free_idct = 0;
+    for (int pi = 0; pi < NUM_PARTIAL_SIZES; pi++) {
+        if (partial_dims[pi] == M && partial_idct[pi]) {
+            idct_sub = partial_idct[pi];
+            break;
         }
+    }
+    if (!idct_sub) {
+        /* Fallback: compute on the fly for non-standard sizes */
+        idct_sub = (float *)malloc(M * M * sizeof(float));
+        if (!idct_sub) return;
+        need_free_idct = 1;
+        for (int n = 0; n < M; n++)
+            for (int k = 0; k < M; k++) {
+                float alpha = (k == 0) ? sqrtf(1.0f / M) : sqrtf(2.0f / M);
+                idct_sub[n * M + k] = alpha * cosf((float)M_PI * (2*n + 1) * k / (2*M));
+            }
+    }
 
     /* Extract the low-frequency M³ sub-cube from coeffs.
      * coeffs[z*N*N + y*N + x] for z,y,x < M → sub[z*M*M + y*M + x] */
@@ -2419,7 +2514,7 @@ static void inverse_dct_partial(const float *coeffs, int M, float *output) {
             }
         }
 
-    free(idct_sub);
+    if (need_free_idct) free(idct_sub);
     free(sub);
     free(tmp);
 }

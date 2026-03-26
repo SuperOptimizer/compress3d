@@ -205,51 +205,40 @@ int main(int argc, char **argv) {
             free(comp80.data);
         }
 
-        /* ── Part 4: Target ratio sweep (lossless/Nx scale) ── */
-        printf("\n═══ TARGET RATIO SWEEP (vs lossless baseline) ═══\n");
-        printf("%-8s %-8s %8s %7s %7s %8s\n",
-               "Target", "Step", "Actual", "PSNR", "MAE", "SSIM");
+        /* ── Part 4: Target ratio sweep using c3d_compress_ratio ── */
+        printf("\n═══ TARGET RATIO SWEEP (c3d_compress_ratio — combined step+truncation) ═══\n");
+        printf("%-8s %8s %8s %7s %7s %6s %5s %8s\n",
+               "Target", "Size", "Actual", "BPV", "PSNR", "MAE", "MaxE", "SSIM");
 
-        int divisors[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
-        int ndivs = sizeof(divisors) / sizeof(divisors[0]);
+        float ratios[] = {1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0};
+        int nratios = sizeof(ratios) / sizeof(ratios[0]);
 
-        for (int d = 0; d < ndivs; d++) {
-            int div = divisors[d];
-            size_t target = lossless_size / div;
-            if (target < 16) target = 16;
-
-            if (div == 1) {
-                printf("%-8s %-8s %7zu %6s %5s %8s\n",
-                       "1x", "lossless", lossless_size, "inf", "0.00", "1.000000");
+        for (int r = 0; r < nratios; r++) {
+            if (ratios[r] <= 1.0f) {
+                printf("%-8s %7zu %7.1f:1 %6.3f %6s %5s %5s %8s\n",
+                       "1x", lossless_size, (double)BLOCK_SIZE/lossless_size,
+                       (double)(lossless_size*8)/BLOCK_SIZE, "inf", "0.00", "0", "1.000000");
                 continue;
             }
 
-            /* Binary search over step to hit target size */
-            float lo = 0.5, hi = 1000.0;
-            float best_step = 50.0;
-            size_t best_diff = (size_t)-1;
-            for (int iter = 0; iter < 20; iter++) {
-                float mid = (lo + hi) / 2;
-                c3d_compressed_t comp = c3d_compress_step(block, mid, 0);
-                if (!comp.data) { lo = mid; continue; }
-                size_t diff = (comp.size > target) ? comp.size - target : target - comp.size;
-                if (diff < best_diff) { best_diff = diff; best_step = mid; }
-                if (comp.size > target) lo = mid; else hi = mid;
-                free(comp.data);
+            c3d_compressed_t comp = c3d_compress_ratio(block, ratios[r]);
+            if (!comp.data) {
+                char label[16]; snprintf(label, sizeof(label), "%.0fx", ratios[r]);
+                printf("%-8s  FAILED\n", label);
+                continue;
             }
-
-            c3d_compressed_t comp = c3d_compress_step(block, best_step, 0);
-            if (!comp.data) { printf("%-8d FAILED\n", div); continue; }
 
             uint8_t recon[BLOCK_SIZE];
             c3d_decompress(comp.data, comp.size, recon);
 
-            char label[16];
-            snprintf(label, sizeof(label), "%dx", div);
-            printf("%-8s %-8.1f %7zu %6.2f %5.2f %8.6f\n",
-                   label, best_step, comp.size,
+            char label[16]; snprintf(label, sizeof(label), "%.0fx", ratios[r]);
+            double actual_ratio = (double)lossless_size / comp.size;
+            printf("%-8s %7zu %7.1f:1 %6.3f %6.2f %5.2f %5d %8.6f\n",
+                   label, comp.size, actual_ratio,
+                   (double)(comp.size*8)/BLOCK_SIZE,
                    c3d_psnr(block, recon, BLOCK_SIZE),
                    c3d_mae(block, recon, BLOCK_SIZE),
+                   c3d_max_error(block, recon, BLOCK_SIZE),
                    c3d_ssim(block, recon));
             free(comp.data);
         }

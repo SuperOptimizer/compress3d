@@ -75,6 +75,14 @@ size_t c3d_compress_step_to(const uint8_t *input, float step, int max_coeffs,
                              uint8_t *output, size_t output_cap);
 
 /*
+ * Compress to a target ratio relative to lossless size.
+ * Automatically finds the best step + coefficient truncation combination.
+ * target_ratio: 1.0 = lossless size, 2.0 = half lossless, 1024.0 = 1/1024 lossless.
+ * Returns compressed blob. Caller must free result.data.
+ */
+c3d_compressed_t c3d_compress_ratio(const uint8_t *input, float target_ratio);
+
+/*
  * Decode at a lower resolution than the full 32³ block.
  * Decodes only enough coefficients for target_dim³ output.
  * target_dim: power of 2, 1 to 32 (1=DC only, 2=2³, ..., 32=full).
