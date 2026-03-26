@@ -92,6 +92,66 @@ c3d_compressed_t c3d_compress_ratio(const uint8_t *input, float target_ratio);
 int c3d_decode_at_resolution(const uint8_t *compressed, size_t compressed_size,
                               int target_dim, uint8_t *output);
 
+/* ══════════════════════════════════════════════════════════════════════════════
+ * Octree-Adaptive Compression (BVH-style spatial indexing)
+ *
+ * Instead of fixed 32³ blocks, adaptively subdivides the volume using an
+ * octree. Empty/uniform regions are stored as single values. Dense regions
+ * are recursively split down to leaf size and DCT-compressed.
+ *
+ * Node types:
+ *   UNIFORM: single value for the entire sub-volume (1 byte + value)
+ *   LEAF:    DCT-compressed block at native size (2-32 per axis)
+ *   BRANCH:  8 children (recursive octree)
+ *
+ * This is a BVH (Bounding Volume Hierarchy) for volumetric data — the tree
+ * structure adapts to data complexity. Sparse regions cost ~1 byte each.
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+#define C3D_OCTREE_MIN_SIZE 2   /* minimum leaf dimension */
+#define C3D_OCTREE_MAX_SIZE 256 /* maximum input dimension per axis */
+
+/* Octree compression parameters */
+typedef struct {
+    int quality;           /* 1-101 for lossy/lossless leaf compression */
+    float uniform_threshold; /* max stddev to consider a region uniform (0-255, default 2.0) */
+    int min_leaf_dim;      /* minimum leaf dimension before forced leaf (default 4) */
+    float step;            /* quantization step for lossy leaves (0 = auto from quality) */
+} c3d_octree_params_t;
+
+/* Compress a volume of arbitrary dimensions using octree-adaptive coding.
+ * Dimensions do NOT need to be powers of 2 or multiples of 32.
+ * The octree adapts to data complexity — empty regions cost ~1 byte.
+ * Returns compressed blob. Caller must free result.data. */
+c3d_compressed_t c3d_octree_compress(const uint8_t *input,
+    int sx, int sy, int sz, const c3d_octree_params_t *params);
+
+/* Decompress octree-compressed data back to a volume.
+ * output must hold sx*sy*sz bytes (dimensions stored in header).
+ * Returns 0 on success, -1 on error. */
+int c3d_octree_decompress(const uint8_t *compressed, size_t compressed_size,
+                           uint8_t *output);
+
+/* Read dimensions from an octree-compressed header without decompressing.
+ * Returns 0 on success. */
+int c3d_octree_get_dims(const uint8_t *compressed, size_t compressed_size,
+                         int *sx, int *sy, int *sz);
+
+/* Get statistics about the octree structure (for analysis). */
+typedef struct {
+    int total_nodes;
+    int uniform_nodes;
+    int leaf_nodes;
+    int branch_nodes;
+    int max_depth;
+    size_t uniform_bytes;   /* bytes used by uniform nodes */
+    size_t leaf_bytes;      /* bytes used by leaf nodes */
+    size_t tree_bytes;      /* bytes used by tree structure */
+} c3d_octree_stats_t;
+
+int c3d_octree_stats(const uint8_t *compressed, size_t compressed_size,
+                      c3d_octree_stats_t *stats);
+
 /* Compress a shard of multiple 32^3 chunks with inter-chunk DC delta coding.
  * chunks: array of pointers to 32768-byte volumes, in raster order (x fastest)
  * nx, ny, nz: number of chunks along each axis (e.g., 4,4,4 for 128^3)

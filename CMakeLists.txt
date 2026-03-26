@@ -4,7 +4,7 @@ project(compress3d C)
 set(CMAKE_C_STANDARD 11)
 
 # The core C3D library — no external dependencies
-add_library(compress3d STATIC src/compress3d.c src/c3d_net.c)
+add_library(compress3d STATIC src/compress3d.c src/c3d_net.c src/c3d_octree.c)
 target_include_directories(compress3d PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>

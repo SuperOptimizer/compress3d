@@ -21,3 +21,7 @@ add_test(NAME test_shard COMMAND test_shard)
 add_executable(test_advanced test_advanced.c)
 target_link_libraries(test_advanced PRIVATE compress3d)
 add_test(NAME test_advanced COMMAND test_advanced)
+
+add_executable(test_octree test_octree.c)
+target_link_libraries(test_octree PRIVATE compress3d)
+add_test(NAME test_octree COMMAND test_octree)
