@@ -58,6 +58,32 @@ size_t c3d_compress_to(const uint8_t *input, int quality, uint8_t *output, size_
  */
 int c3d_decompress_to(const uint8_t *compressed, size_t compressed_size, uint8_t *output);
 
+/*
+ * Compress with explicit quantization step size for fine-grained control.
+ * step: 0.1 (near-lossless) to 500+ (extreme compression).
+ *   step=0.5 ≈ quality 100, step=50 ≈ quality 1.
+ *   step > 50 extends beyond quality 1 for ultra-high compression.
+ * max_coeffs: maximum non-zero coefficients to keep in zigzag order.
+ *   0 = no limit (default). Positive value = explicit low-pass truncation.
+ *   e.g., 512 keeps only the 8³ low-frequency cube → ~64x compression.
+ * Returns compressed blob. Caller must free result.data.
+ */
+c3d_compressed_t c3d_compress_step(const uint8_t *input, float step, int max_coeffs);
+
+/* Buffer-output version of c3d_compress_step. Returns compressed size, 0 on error. */
+size_t c3d_compress_step_to(const uint8_t *input, float step, int max_coeffs,
+                             uint8_t *output, size_t output_cap);
+
+/*
+ * Decode at a lower resolution than the full 32³ block.
+ * Decodes only enough coefficients for target_dim³ output.
+ * target_dim: power of 2, 1 to 32 (1=DC only, 2=2³, ..., 32=full).
+ * output: must hold target_dim³ bytes.
+ * Returns 0 on success, -1 on error.
+ */
+int c3d_decode_at_resolution(const uint8_t *compressed, size_t compressed_size,
+                              int target_dim, uint8_t *output);
+
 /* Compress a shard of multiple 32^3 chunks with inter-chunk DC delta coding.
  * chunks: array of pointers to 32768-byte volumes, in raster order (x fastest)
  * nx, ny, nz: number of chunks along each axis (e.g., 4,4,4 for 128^3)

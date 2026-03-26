@@ -1783,6 +1783,99 @@ c3d_compressed_t c3d_compress(const uint8_t *input, int quality) {
     return (c3d_compressed_t){ .data = buf, .size = actual };
 }
 
+/* ── Step-based compression with coefficient truncation ── */
+
+size_t c3d_compress_step_to(const uint8_t *input, float step, int max_coeffs,
+                             uint8_t *output, size_t output_cap) {
+    if (!input || !output || step <= 0.0f) return 0;
+    init_tables();
+
+    float *vol = (float *)malloc(N3 * sizeof(float));
+    if (!vol) return 0;
+    for (int i = 0; i < N3; i++)
+        vol[i] = (float)input[i] - 128.0f;
+
+    dct3d_forward_all(vol);
+
+    float *qtable = (float *)malloc(N3 * sizeof(float));
+    float *dz_table = (float *)malloc(N3 * sizeof(float));
+    float *bias_table = (float *)malloc(N3 * sizeof(float));
+    int32_t *quant = (int32_t *)malloc(N3 * sizeof(int32_t));
+    if (!qtable || !dz_table || !bias_table || !quant) {
+        free(vol); free(qtable); free(dz_table); free(bias_table); free(quant);
+        return 0;
+    }
+    compute_quant_table(step, qtable, dz_table, bias_table);
+    quantize_volume(vol, quant, qtable, dz_table, bias_table);
+
+    /* Skip RD optimization at high step values (diminishing returns) */
+    if (step <= 30.0f)
+        rd_optimize_coeffs(vol, quant, qtable, step * step * 0.8f);
+
+    /* Coefficient truncation: force-zero all beyond max_coeffs in zigzag order */
+    if (max_coeffs > 0 && max_coeffs < N3) {
+        for (int i = max_coeffs; i < N3; i++)
+            quant[zigzag_order[i]] = 0;
+    }
+    /* Auto-truncation at extreme step sizes: keep only coefficients that survive
+     * the large quantization step naturally, plus limit by frequency budget */
+    if (max_coeffs <= 0 && step > 50.0f) {
+        int budget = (int)(N3 * 50.0f / step);
+        if (budget < 1) budget = 1;
+        if (budget < N3) {
+            for (int i = budget; i < N3; i++)
+                quant[zigzag_order[i]] = 0;
+        }
+    }
+
+    coeff_predict_forward(quant);
+
+    symstream_t syms;
+    sym_init(&syms);
+    coeffs_to_symbols(quant, &syms);
+
+    /* Map step back to quality for the header (best-effort approximation) */
+    int quality = 1;
+    for (int q = 100; q >= 1; q--) {
+        if (quality_step_table[q] <= step) { quality = q; break; }
+    }
+
+    /* At high step, skip the 4-mode trial (order-0 always wins with sparse data) */
+    size_t total;
+    if (step > 30.0f) {
+        /* Fast path: order-0 interleaved only */
+        rans_model_t model_o0;
+        rans_build_model(syms.symbols, syms.count, &model_o0);
+        size_t rans_needed = (size_t)syms.count * 2 + 256;
+        uint8_t *rans_buf = (uint8_t *)malloc(rans_needed);
+        if (!rans_buf) { free(vol); free(qtable); free(dz_table); free(bias_table); free(quant); free(syms.symbols); return 0; }
+        size_t rans_len;
+        rans_encode_interleaved(syms.symbols, syms.count, &model_o0, rans_buf, &rans_len);
+        total = pack_order0(output, quality, &syms, &model_o0, rans_buf, rans_len);
+        output[7] |= C3D_FLAG_COEFF_PRED;
+        free(rans_buf);
+    } else {
+        total = encode_and_pack(&syms, quality, C3D_FLAG_COEFF_PRED,
+                                output, output_cap, NULL, 0);
+    }
+
+    free(vol); free(dz_table); free(bias_table); free(qtable); free(quant); free(syms.symbols);
+    return total;
+}
+
+c3d_compressed_t c3d_compress_step(const uint8_t *input, float step, int max_coeffs) {
+    if (!input) return (c3d_compressed_t){ .data = NULL, .size = 0 };
+    size_t bound = c3d_compress_bound();
+    uint8_t *buf = (uint8_t *)malloc(bound);
+    if (!buf) return (c3d_compressed_t){ .data = NULL, .size = 0 };
+
+    size_t actual = c3d_compress_step_to(input, step, max_coeffs, buf, bound);
+    if (actual == 0) { free(buf); return (c3d_compressed_t){ .data = NULL, .size = 0 }; }
+
+    buf = (uint8_t *)realloc(buf, actual);
+    return (c3d_compressed_t){ .data = buf, .size = actual };
+}
+
 static int c3d_decompress_wavelet_internal(const uint8_t *compressed, size_t compressed_size, uint8_t *output);
 
 static int c3d_decompress_roi(const uint8_t *compressed, size_t compressed_size, uint8_t *output);
@@ -2233,6 +2326,175 @@ int c3d_get_size(const uint8_t *compressed, size_t compressed_size) {
         return C3D_BLOCK_SIZE;
 
     return -1;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * SECTION 6a: Native multiscale decode via partial inverse DCT
+ *
+ * The 3D DCT coefficients at (kx,ky,kz) for kx,ky,kz < M form a valid M³
+ * DCT. Inverse-transforming this sub-cube gives a perfect M³ downscale.
+ * This makes the DCT itself the multiscale pyramid — no separate
+ * downsample/upsample needed.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/* Partial inverse DCT: extract the low-frequency M³ sub-cube from N³ coefficients,
+ * apply M×M×M inverse DCT, produce an M³ output volume.
+ * coeffs: N³ float coefficients in natural (z,y,x) order (not zigzag).
+ * M: output dimension (must be power of 2, 1 ≤ M ≤ N).
+ */
+static void inverse_dct_partial(const float *coeffs, int M, float *output) {
+    if (M == N) {
+        /* Full size — use the existing optimized path */
+        memcpy(output, coeffs, N3 * sizeof(float));
+        dct3d_inverse_all(output);
+        return;
+    }
+
+    /* Build M×M×M inverse DCT matrices by taking the first M rows/columns.
+     * idct_sub[n][k] = idct_matrix[n * N/M][k] scaled by sqrt(N/M) for
+     * energy normalization... Actually, the correct approach is simpler:
+     * just build M×M DCT-II basis directly. */
+    int M3 = M * M * M;
+    float *idct_sub = (float *)malloc(M * M * sizeof(float));
+    if (!idct_sub) return;
+
+    for (int n = 0; n < M; n++)
+        for (int k = 0; k < M; k++) {
+            float alpha = (k == 0) ? sqrtf(1.0f / M) : sqrtf(2.0f / M);
+            idct_sub[n * M + k] = alpha * cosf((float)M_PI * (2*n + 1) * k / (2*M));
+        }
+
+    /* Extract the low-frequency M³ sub-cube from coeffs.
+     * coeffs[z*N*N + y*N + x] for z,y,x < M → sub[z*M*M + y*M + x] */
+    float *sub = (float *)calloc(M3, sizeof(float));
+    if (!sub) { free(idct_sub); return; }
+    for (int z = 0; z < M; z++)
+        for (int y = 0; y < M; y++)
+            for (int x = 0; x < M; x++)
+                sub[z*M*M + y*M + x] = coeffs[z*N*N + y*N + x];
+
+    /* Apply separable 3-axis inverse DCT using the M×M basis.
+     * Transform rows along X, then Y, then Z. */
+    float *tmp = (float *)malloc(M3 * sizeof(float));
+    if (!tmp) { free(idct_sub); free(sub); return; }
+
+    /* X-axis: transform each row of length M */
+    for (int z = 0; z < M; z++)
+        for (int y = 0; y < M; y++) {
+            float *row = sub + z*M*M + y*M;
+            float *dst = tmp + z*M*M + y*M;
+            for (int n = 0; n < M; n++) {
+                float sum = 0;
+                for (int k = 0; k < M; k++)
+                    sum += idct_sub[n * M + k] * row[k];
+                dst[n] = sum;
+            }
+        }
+
+    /* Y-axis: transform each column of length M */
+    for (int z = 0; z < M; z++)
+        for (int x = 0; x < M; x++) {
+            float col[32]; /* M ≤ 32 */
+            for (int y = 0; y < M; y++)
+                col[y] = tmp[z*M*M + y*M + x];
+            for (int n = 0; n < M; n++) {
+                float sum = 0;
+                for (int k = 0; k < M; k++)
+                    sum += idct_sub[n * M + k] * col[k];
+                sub[z*M*M + n*M + x] = sum;
+            }
+        }
+
+    /* Z-axis: transform each column of length M */
+    for (int y = 0; y < M; y++)
+        for (int x = 0; x < M; x++) {
+            float col[32];
+            for (int z = 0; z < M; z++)
+                col[z] = sub[z*M*M + y*M + x];
+            for (int n = 0; n < M; n++) {
+                float sum = 0;
+                for (int k = 0; k < M; k++)
+                    sum += idct_sub[n * M + k] * col[k];
+                output[n*M*M + y*M + x] = sum;
+            }
+        }
+
+    free(idct_sub);
+    free(sub);
+    free(tmp);
+}
+
+int c3d_decode_at_resolution(const uint8_t *compressed, size_t compressed_size,
+                              int target_dim, uint8_t *output) {
+    if (!compressed || !output) return -1;
+    if (target_dim < 1 || target_dim > N) return -1;
+    /* Must be power of 2 */
+    if (target_dim & (target_dim - 1)) return -1;
+
+    init_tables();
+
+    /* Full resolution: delegate to normal decompress */
+    if (target_dim == N)
+        return c3d_decompress_to(compressed, compressed_size, output);
+
+    /* Must be a lossy DCT block (C3D\x04, byte 5 = DCT, byte 6 != lossless) */
+    if (compressed_size < 16) return -1;
+    if (compressed[0] != 'C' || compressed[1] != '3' ||
+        compressed[2] != 'D' || compressed[3] != 0x04)
+        return -1;
+    if (compressed[6] == 1) return -1; /* lossless has no DCT coefficients */
+    if (compressed[5] == C3D_TRANSFORM_WAVELET) return -1; /* TODO: wavelet partial */
+
+    int quality = compressed[4];
+    uint32_t sym_len = compressed[8] | ((uint32_t)compressed[9]<<8)
+                     | ((uint32_t)compressed[10]<<16) | ((uint32_t)compressed[11]<<24);
+    if (sym_len > (uint32_t)N3 * 6) return -1;
+
+    /* Decode symbols */
+    uint8_t *syms = (uint8_t *)malloc(sym_len > 0 ? sym_len : 1);
+    if (!syms) return -1;
+    if (decode_symbols(compressed, compressed_size, syms, sym_len) != 0) {
+        free(syms); return -1;
+    }
+
+    /* VLQ decode → quantized coefficients */
+    int32_t *quant = (int32_t *)malloc(N3 * sizeof(int32_t));
+    if (!quant) { free(syms); return -1; }
+    if (symbols_to_coeffs(syms, (int)sym_len, quant) != 0) {
+        free(syms); free(quant); return -1;
+    }
+    free(syms);
+
+    if (compressed[7] & C3D_FLAG_COEFF_PRED)
+        coeff_predict_inverse(quant);
+
+    /* Dequantize to float coefficients in natural order */
+    float step = quality_to_step(quality);
+    float *qtable = (float *)malloc(N3 * sizeof(float));
+    float *vol = (float *)malloc(N3 * sizeof(float));
+    if (!qtable || !vol) { free(quant); free(qtable); free(vol); return -1; }
+    compute_dequant_table(step, qtable);
+    dequantize_volume(quant, vol, qtable);
+    free(quant); free(qtable);
+
+    /* Partial inverse DCT at target resolution */
+    int M = target_dim;
+    int M3 = M * M * M;
+    float *partial = (float *)malloc(M3 * sizeof(float));
+    if (!partial) { free(vol); return -1; }
+    inverse_dct_partial(vol, M, partial);
+    free(vol);
+
+    /* Convert to uint8 with bias */
+    for (int i = 0; i < M3; i++) {
+        float v = partial[i] + 128.0f;
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        output[i] = (uint8_t)(v + 0.5f);
+    }
+    free(partial);
+
+    return 0;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
