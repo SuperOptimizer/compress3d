@@ -1,0 +1,3 @@
+add_executable(test_compress3d test_compress3d.c)
+target_link_libraries(test_compress3d PRIVATE compress3d)
+add_test(NAME test_compress3d COMMAND test_compress3d)
